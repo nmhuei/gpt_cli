@@ -48,14 +48,14 @@ class WireTransport:
             payload["conversation_id"] = conversation_id
         return payload
 
-    async def send_turn(
+    async def _send_once(
         self,
         prompt: str,
-        conversation_id: str | None = None,
-        parent_id: str | None = None,
-        model_alias: str | None = None,
-        effort: str | None = None,
-        on_event: Callable[[Any], None] | None = None,
+        conversation_id: str | None,
+        parent_id: str | None,
+        model_alias: str | None,
+        effort: str | None,
+        on_event: Callable[[Any], None] | None,
     ) -> TurnResult:
         model_def = ModelRegistry.resolve(model_alias)
         t0 = time.perf_counter()
@@ -100,23 +100,33 @@ class WireTransport:
         captured_conv_id = conversation_id
         last_msg_id = parent_id or ""
         resolved_model = model_def.slug
+        is_done = False
 
         from ..telemetry.parser import SSETelemetryParser
         parser = SSETelemetryParser()
 
-        async for chunk in response.aiter_content():
-            events = parser.feed(chunk)
-            for ev in events:
-                if on_event:
-                    on_event(ev)
-                if ev.event_type == "delta":
-                    text_chunk = ev.data.get("text", "")
-                    if text_chunk:
-                        full_text.append(text_chunk)
-                elif ev.event_type == "conversation_id":
-                    captured_conv_id = ev.data.get("conversation_id")
-                elif ev.event_type == "message_id":
-                    last_msg_id = ev.data.get("message_id")
+        try:
+            async for chunk in response.aiter_content():
+                events = parser.feed(chunk)
+                for ev in events:
+                    if on_event:
+                        on_event(ev)
+                    if ev.event_type == "delta":
+                        text_chunk = ev.data.get("text", "")
+                        if text_chunk:
+                            full_text.append(text_chunk)
+                    elif ev.event_type == "conversation_id":
+                        captured_conv_id = ev.data.get("conversation_id")
+                    elif ev.event_type == "message_id":
+                        last_msg_id = ev.data.get("message_id")
+                    elif ev.event_type == "done":
+                        is_done = True
+                if is_done:
+                    break
+        except Exception:
+            # If server terminated socket after sending text or done signal, ignore premature close
+            if not full_text:
+                raise
 
         for ev in parser.finish():
             if on_event:
@@ -138,6 +148,35 @@ class WireTransport:
             model=resolved_model,
             duration_ms=int((t1 - t0) * 1000)
         )
+
+    async def send_turn(
+        self,
+        prompt: str,
+        conversation_id: str | None = None,
+        parent_id: str | None = None,
+        model_alias: str | None = None,
+        effort: str | None = None,
+        on_event: Callable[[Any], None] | None = None,
+        max_retries: int = 2,
+    ) -> TurnResult:
+        last_err: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                return await self._send_once(
+                    prompt=prompt,
+                    conversation_id=conversation_id,
+                    parent_id=parent_id,
+                    model_alias=model_alias,
+                    effort=effort,
+                    on_event=on_event,
+                )
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                else:
+                    raise last_err from None
+        raise last_err or RuntimeError("send_turn failed after retries")
 
     async def close(self):
         await self.session.close()

@@ -153,7 +153,11 @@ class SSETelemetryParser:
                         if delta:
                             events.append(TelemetryEvent(event_type="delta", data={"text": delta}))
 
-                if status in COMPLETION_STATUSES:
+                if (
+                    role == "assistant"
+                    and content.get("content_type") == "text"
+                    and status in COMPLETION_STATUSES
+                ):
                     events.append(TelemetryEvent(event_type="done", data={}))
 
         return events
