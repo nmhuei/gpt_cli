@@ -8,6 +8,7 @@ from typing import Any
 from ..config import defaults
 from ..core.token_cache import TokenCacheManager
 from ..session.registry import SessionRegistry
+from ..session.logger import SessionLogManager
 from ..transport.wire import WireTransport
 from ..server.daemon import start_daemon, stop_daemon, status_daemon
 
@@ -40,6 +41,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
     show_p = sess_sub.add_parser("show", help="Show session details")
     show_p.add_argument("session_id", help="Local session ID")
     show_p.add_argument("--json", action="store_true", help="Output JSON")
+
+    # session log
+    log_p = sess_sub.add_parser("log", help="View session transcript, prompts, responses, and debug logs")
+    log_p.add_argument("session_id", nargs="?", default=None, help="Local session ID (default: active session)")
+    log_p.add_argument("--turn", type=int, default=None, help="Filter to specific turn number")
+    log_p.add_argument("--tail", type=int, default=None, help="Show last N turns")
+    log_p.add_argument("--events", action="store_true", help="Show granular telemetry events instead of turn history")
+    log_p.add_argument("--json", action="store_true", help="Output JSON format")
 
     # session set
     set_p = sess_sub.add_parser("set", help="Set active session")
@@ -75,6 +84,8 @@ async def handle_run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     reg = SessionRegistry()
+    log_mgr = SessionLogManager()
+
     if args.new:
         sess = reg.create_session(tag=args.tag)
     elif args.session:
@@ -82,22 +93,62 @@ async def handle_run(args: argparse.Namespace) -> None:
     else:
         sess = reg.get_or_create(tag=args.tag)
 
-    full_output = []
+    turn_number = sess.turns + 1
+    captured_thoughts: list[str] = []
+    captured_tools: list[dict[str, Any]] = []
+
     def on_event(ev):
-        if not args.json and ev.event_type == "delta":
+        log_mgr.log_event(sess.local_id, ev, turn_index=turn_number)
+        if ev.event_type == "thinking":
+            for th in ev.data.get("thoughts", []):
+                if isinstance(th, str) and th not in captured_thoughts:
+                    captured_thoughts.append(th)
+        elif ev.event_type == "tool_call_started":
+            captured_tools.append(ev.data)
+        elif not args.json and ev.event_type == "delta":
             delta_text = ev.data.get("text", "")
             sys.stdout.write(delta_text)
             sys.stdout.flush()
 
-    async with WireTransport(bundle) as transport:
-        result = await transport.send_turn(
+    err_str = None
+    try:
+        async with WireTransport(bundle) as transport:
+            result = await transport.send_turn(
+                prompt=args.prompt,
+                conversation_id=sess.conversation_id,
+                parent_id=sess.last_message_id,
+                model_alias=args.model,
+                effort=args.effort,
+                on_event=on_event
+            )
+    except Exception as e:
+        err_str = str(e)
+        log_mgr.log_turn(
+            local_id=sess.local_id,
+            turn_index=turn_number,
             prompt=args.prompt,
+            response="",
+            model=args.model,
+            duration_ms=0,
             conversation_id=sess.conversation_id,
-            parent_id=sess.last_message_id,
-            model_alias=args.model,
-            effort=args.effort,
-            on_event=on_event
+            message_id=sess.last_message_id,
+            error=err_str
         )
+        raise
+
+    # Log turn to history
+    log_mgr.log_turn(
+        local_id=sess.local_id,
+        turn_index=turn_number,
+        prompt=args.prompt,
+        response=result.text,
+        model=result.model,
+        duration_ms=result.duration_ms,
+        conversation_id=result.conversation_id,
+        message_id=result.message_id,
+        thinking=captured_thoughts,
+        tool_calls=captured_tools
+    )
 
     # Update session in registry with DAG parent/leaf IDs
     reg.update_turn(
@@ -115,7 +166,8 @@ async def handle_run(args: argparse.Namespace) -> None:
             "conversation_id": result.conversation_id,
             "message_id": result.message_id,
             "model": result.model,
-            "duration_ms": result.duration_ms
+            "duration_ms": result.duration_ms,
+            "log_dir": str(log_mgr.session_dir(sess.local_id))
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
@@ -124,6 +176,7 @@ async def handle_run(args: argparse.Namespace) -> None:
 
 def handle_session(args: argparse.Namespace) -> None:
     reg = SessionRegistry()
+    log_mgr = SessionLogManager()
     active = reg.get_active()
 
     if args.session_action == "list":
@@ -131,7 +184,10 @@ def handle_session(args: argparse.Namespace) -> None:
         if args.json:
             out = {
                 "active_id": active.local_id if active else None,
-                "sessions": [s.to_dict() for s in sessions]
+                "sessions": [
+                    {**s.to_dict(), "log_dir": str(log_mgr.session_dir(s.local_id))}
+                    for s in sessions
+                ]
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
         else:
@@ -150,8 +206,10 @@ def handle_session(args: argparse.Namespace) -> None:
         if not sess:
             print(f"Session {args.session_id} not found.", file=sys.stderr)
             sys.exit(1)
+        data = sess.to_dict()
+        data["log_dir"] = str(log_mgr.session_dir(sess.local_id))
         if args.json:
-            print(json.dumps(sess.to_dict(), ensure_ascii=False, indent=2))
+            print(json.dumps(data, ensure_ascii=False, indent=2))
         else:
             print(f"Local ID:        {sess.local_id}")
             print(f"Conversation ID: {sess.conversation_id}")
@@ -159,6 +217,37 @@ def handle_session(args: argparse.Namespace) -> None:
             print(f"Turns:           {sess.turns}")
             print(f"Tag:             {sess.tag}")
             print(f"Updated At:      {sess.updated_at}")
+            print(f"Log Directory:   {log_mgr.session_dir(sess.local_id)}")
+
+    elif args.session_action == "log":
+        target_id = args.session_id or (active.local_id if active else None)
+        if not target_id:
+            print("Error: No session specified and no active session found.", file=sys.stderr)
+            sys.exit(1)
+
+        if args.events:
+            events = log_mgr.get_events(target_id, turn_index=args.turn)
+            if args.json:
+                print(json.dumps({"session_id": target_id, "events": events}, ensure_ascii=False, indent=2))
+            else:
+                print(f"=== EVENTS FOR SESSION: {target_id} ===")
+                for ev in events:
+                    t_idx = ev.get("turn_index")
+                    ts = ev.get("timestamp", "")[:19]
+                    etype = ev.get("event_type")
+                    print(f"[{ts}] [Turn #{t_idx}] {etype}: {ev.get('data')}")
+        else:
+            history = log_mgr.get_history(target_id)
+            if args.turn is not None:
+                history = [h for h in history if h.get("turn_index") == args.turn]
+            if args.tail is not None and args.tail > 0:
+                history = history[-args.tail:]
+
+            if args.json:
+                print(json.dumps({"session_id": target_id, "history": history}, ensure_ascii=False, indent=2))
+            else:
+                formatted = log_mgr.format_readable_log(target_id, max_turns=args.tail)
+                print(formatted)
 
     elif args.session_action == "set":
         sess = reg.get_session(args.session_id)

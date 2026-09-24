@@ -51,6 +51,19 @@ gpt session show sess_e3affde1 --json
 # Đổi session active
 gpt session set sess_e3affde1
 
+# Đọc toàn bộ lịch sử transcript (prompt, response, thinking, duration) của session
+gpt session log sess_e3affde1
+
+# Đọc log transcript dạng JSON (cho AI agent parse phân tích khi debug)
+gpt session log sess_e3affde1 --json
+
+# Đọc chuỗi telemetry events chi tiết thời gian thực (thoughts, web queries, tool calls)
+gpt session log sess_e3affde1 --events
+
+# Chỉ đọc N turns gần nhất hoặc turn cụ thể
+gpt session log sess_e3affde1 --tail 3
+gpt session log sess_e3affde1 --turn 2
+
 # Xóa một session
 gpt session delete sess_e3affde1
 ```
