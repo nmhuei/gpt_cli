@@ -54,6 +54,7 @@ class WireTransport:
         conversation_id: str | None = None,
         parent_id: str | None = None,
         model_alias: str | None = None,
+        effort: str | None = None,
         on_event: Callable[[Any], None] | None = None,
     ) -> TurnResult:
         model_def = ModelRegistry.resolve(model_alias)
@@ -73,7 +74,8 @@ class WireTransport:
             prompt=prompt,
             conversation_id=conversation_id,
             parent_id=parent_id,
-            model_alias=model_alias
+            model_alias=model_alias,
+            effort=effort,
         )
 
         # Step 3: Post Conversation Stream

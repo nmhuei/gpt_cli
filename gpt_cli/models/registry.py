@@ -32,6 +32,10 @@ class ModelRegistry:
     }
 
     @classmethod
+    def all_models(cls) -> list[ModelDefinition]:
+        return list(cls._MODELS.values())
+
+    @classmethod
     def resolve(cls, name_or_alias: str | None = None) -> ModelDefinition:
         if not name_or_alias:
             return cls._MODELS[cls.DEFAULT_SLUG]
