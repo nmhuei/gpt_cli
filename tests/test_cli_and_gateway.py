@@ -15,6 +15,20 @@ def test_gateway_health():
     assert data["model"] == "gpt-5-6-thinking"
     assert data["transport"] == "wire_conduit"
 
+def test_gateway_models():
+    app = create_app()
+    client = TestClient(app)
+    res = client.get("/v1/models")
+    assert res.status_code == 200
+    assert len(res.json()["data"]) >= 1
+
+def test_gateway_messages_empty_validation():
+    app = create_app()
+    client = TestClient(app)
+    res = client.post("/v1/messages", json={"model": "gpt-5-6-thinking", "messages": []})
+    assert res.status_code == 400
+    assert "Messages cannot be empty" in res.json()["error"]["message"]
+
 def test_cli_parser_run_command():
     parser = build_cli_parser()
     args = parser.parse_args(["run", "-p", "Test prompt", "--json", "-s", "sess_custom", "--new"])

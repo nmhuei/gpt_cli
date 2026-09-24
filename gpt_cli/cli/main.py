@@ -29,7 +29,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
     run_p.add_argument("-e", "--effort", default="extended", help="Thinking effort")
     run_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
-    # 2. session
+    # 2. chat (interactive)
+    chat_p = subparsers.add_parser("chat", help="Start interactive terminal chat session")
+    chat_p.add_argument("-s", "--session", default=None, help="Continue specific session ID")
+    chat_p.add_argument("-m", "--model", default="gpt-5-6-thinking", help="Model alias")
+
+    # 3. session
     sess_p = subparsers.add_parser("session", help="Manage tool-created sessions")
     sess_sub = sess_p.add_subparsers(dest="session_action", required=True)
     
@@ -58,7 +63,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     del_p = sess_sub.add_parser("delete", help="Delete a session")
     del_p.add_argument("session_id", help="Local session ID")
 
-    # 3. Gateway control
+    # 4. Gateway control
     start_p = subparsers.add_parser("start", help="Start gateway daemon")
     start_p.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
     start_p.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
@@ -73,11 +78,104 @@ def build_cli_parser() -> argparse.ArgumentParser:
 
     return parser
 
+async def interactive_chat(model: str = "gpt-5-6-thinking", session_id: str | None = None) -> None:
+    cache_mgr = TokenCacheManager()
+    bundle = cache_mgr.load_disk_cache()
+    if not bundle:
+        print("Error: No token bundle found in cache (~/.local/share/webgpt/profiles/personal).", file=sys.stderr)
+        sys.exit(1)
+
+    reg = SessionRegistry()
+    log_mgr = SessionLogManager()
+    sess = reg.get_or_create(session_id=session_id)
+
+    print(f"/home/light · {model} · personal (Wire Conduit · 0 MB RAM)")
+    print(f"Session: {sess.local_id} (turns: {sess.turns})")
+    print("Type /exit to quit, /new to clear session, /session for details.\n")
+
+    while True:
+        try:
+            user_input = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if not user_input:
+            continue
+        if user_input in {"/exit", "/quit"}:
+            print("Exiting.")
+            break
+        if user_input == "/new":
+            sess = reg.create_session()
+            print(f"Started fresh session: {sess.local_id}\n")
+            continue
+        if user_input == "/session":
+            print(f"Local ID:        {sess.local_id}")
+            print(f"Conversation ID: {sess.conversation_id}")
+            print(f"Last Message ID: {sess.last_message_id}")
+            print(f"Turns:           {sess.turns}")
+            print(f"Log Dir:         {log_mgr.session_dir(sess.local_id)}\n")
+            continue
+        if user_input == "/help":
+            print("Commands: /new, /session, /exit, /help\n")
+            continue
+
+        turn_number = sess.turns + 1
+        captured_thoughts: list[str] = []
+        captured_tools: list[dict[str, Any]] = []
+
+        def on_event(ev):
+            log_mgr.log_event(sess.local_id, ev, turn_index=turn_number)
+            if ev.event_type == "delta":
+                sys.stdout.write(ev.data.get("text", ""))
+                sys.stdout.flush()
+            elif ev.event_type == "thinking":
+                for th in ev.data.get("thoughts", []):
+                    if isinstance(th, str) and th not in captured_thoughts:
+                        captured_thoughts.append(th)
+            elif ev.event_type == "tool_call_started":
+                captured_tools.append(ev.data)
+
+        try:
+            async with WireTransport(bundle) as transport:
+                result = await transport.send_turn(
+                    prompt=user_input,
+                    conversation_id=sess.conversation_id,
+                    parent_id=sess.last_message_id,
+                    model_alias=model,
+                    on_event=on_event
+                )
+            sys.stdout.write("\n\n")
+            sys.stdout.flush()
+
+            log_mgr.log_turn(
+                local_id=sess.local_id,
+                turn_index=turn_number,
+                prompt=user_input,
+                response=result.text,
+                model=result.model,
+                duration_ms=result.duration_ms,
+                conversation_id=result.conversation_id,
+                message_id=result.message_id,
+                thinking=captured_thoughts,
+                tool_calls=captured_tools
+            )
+
+            reg.update_turn(
+                local_id=sess.local_id,
+                conversation_id=result.conversation_id,
+                last_message_id=result.message_id,
+                model=result.model
+            )
+            sess = reg.get_session(sess.local_id) or sess
+        except Exception as e:
+            print(f"\nError: {e}\n", file=sys.stderr)
+
 async def handle_run(args: argparse.Namespace) -> None:
     cache_mgr = TokenCacheManager()
     bundle = cache_mgr.load_disk_cache()
     if not bundle:
-        if args.json:
+        if getattr(args, "json", False):
             print(json.dumps({"status": "error", "message": "No valid token bundle found in disk cache"}))
         else:
             print("Error: No token bundle found in cache (~/.local/share/webgpt/profiles/personal).", file=sys.stderr)
@@ -86,12 +184,12 @@ async def handle_run(args: argparse.Namespace) -> None:
     reg = SessionRegistry()
     log_mgr = SessionLogManager()
 
-    if args.new:
-        sess = reg.create_session(tag=args.tag)
-    elif args.session:
-        sess = reg.get_or_create(session_id=args.session, tag=args.tag)
+    if getattr(args, "new", False):
+        sess = reg.create_session(tag=getattr(args, "tag", None))
+    elif getattr(args, "session", None):
+        sess = reg.get_or_create(session_id=args.session, tag=getattr(args, "tag", None))
     else:
-        sess = reg.get_or_create(tag=args.tag)
+        sess = reg.get_or_create(tag=getattr(args, "tag", None))
 
     turn_number = sess.turns + 1
     captured_thoughts: list[str] = []
@@ -105,7 +203,7 @@ async def handle_run(args: argparse.Namespace) -> None:
                     captured_thoughts.append(th)
         elif ev.event_type == "tool_call_started":
             captured_tools.append(ev.data)
-        elif not args.json and ev.event_type == "delta":
+        elif not getattr(args, "json", False) and ev.event_type == "delta":
             delta_text = ev.data.get("text", "")
             sys.stdout.write(delta_text)
             sys.stdout.flush()
@@ -117,8 +215,8 @@ async def handle_run(args: argparse.Namespace) -> None:
                 prompt=args.prompt,
                 conversation_id=sess.conversation_id,
                 parent_id=sess.last_message_id,
-                model_alias=args.model,
-                effort=args.effort,
+                model_alias=getattr(args, "model", "gpt-5-6-thinking"),
+                effort=getattr(args, "effort", "extended"),
                 on_event=on_event
             )
     except Exception as e:
@@ -128,7 +226,7 @@ async def handle_run(args: argparse.Namespace) -> None:
             turn_index=turn_number,
             prompt=args.prompt,
             response="",
-            model=args.model,
+            model=getattr(args, "model", "gpt-5-6-thinking"),
             duration_ms=0,
             conversation_id=sess.conversation_id,
             message_id=sess.last_message_id,
@@ -136,7 +234,6 @@ async def handle_run(args: argparse.Namespace) -> None:
         )
         raise
 
-    # Log turn to history
     log_mgr.log_turn(
         local_id=sess.local_id,
         turn_index=turn_number,
@@ -150,7 +247,6 @@ async def handle_run(args: argparse.Namespace) -> None:
         tool_calls=captured_tools
     )
 
-    # Update session in registry with DAG parent/leaf IDs
     reg.update_turn(
         local_id=sess.local_id,
         conversation_id=result.conversation_id,
@@ -158,7 +254,7 @@ async def handle_run(args: argparse.Namespace) -> None:
         model=result.model
     )
 
-    if args.json:
+    if getattr(args, "json", False):
         out = {
             "status": "ok",
             "text": result.text,
@@ -266,6 +362,30 @@ def handle_session(args: argparse.Namespace) -> None:
             sys.exit(1)
 
 def main() -> None:
+    known_commands = {"run", "chat", "session", "start", "stop", "restart", "status", "-h", "--help"}
+
+    # Case 1: Plain `gpt` with no arguments -> interactive chat!
+    if len(sys.argv) == 1:
+        asyncio.run(interactive_chat())
+        return
+
+    # Case 2: `gpt "some prompt text"` without `run -p`
+    first_arg = sys.argv[1]
+    if first_arg not in known_commands and not first_arg.startswith("-"):
+        prompt = " ".join(sys.argv[1:]).strip()
+        args = argparse.Namespace(
+            command="run",
+            prompt=prompt,
+            session=None,
+            new=False,
+            tag=None,
+            model="gpt-5-6-thinking",
+            effort="extended",
+            json=False
+        )
+        asyncio.run(handle_run(args))
+        return
+
     parser = build_cli_parser()
     args = parser.parse_args()
 
@@ -275,6 +395,8 @@ def main() -> None:
 
     if args.command == "run":
         asyncio.run(handle_run(args))
+    elif args.command == "chat":
+        asyncio.run(interactive_chat(model=args.model, session_id=args.session))
     elif args.command == "session":
         handle_session(args)
     elif args.command == "start":
