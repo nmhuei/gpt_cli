@@ -1,0 +1,53 @@
+$ .venv/bin/python scripts/soak_runner.py --scenario stable --turns 100 --interval 20 --dry-run
+{
+  "mode": "DRY-RUN (nothing will be sent)",
+  "scenario": "stable",
+  "target": "http://127.0.0.1:18000",
+  "turns": 100,
+  "interval_s": 20.0,
+  "concurrency": 1,
+  "rss_interval_s": 30.0,
+  "recovery_kill_at_turn": null,
+  "report_dir": "/home/light/GitHub/gpt/docs/reports/soak",
+  "jsonl": "(auto: alongside report)",
+  "long_run_flag_used": false,
+  "would_refuse_without_long_flag": false,
+  "thresholds": {
+    "max_error_rate_pct": 2.0,
+    "max_turn_latency_s": 120.0,
+    "max_p95_latency_s": 90.0,
+    "max_rss_growth_pct": 20.0,
+    "require_recovered": false
+  }
+}
+[dry-run] no request sent, no metric collected.
+exit=0
+
+$ .venv/bin/python scripts/soak_runner.py --scenario recovery --turns 20 --interval 15 --port 18000 --dry-run
+{
+  "mode": "DRY-RUN (nothing will be sent)",
+  "scenario": "recovery",
+  "target": "http://127.0.0.1:18000",
+  "turns": 20,
+  "interval_s": 15.0,
+  "concurrency": 1,
+  "rss_interval_s": 30.0,
+  "recovery_kill_at_turn": 10,
+  "report_dir": "/home/light/GitHub/gpt/docs/reports/soak",
+  "jsonl": "(auto: alongside report)",
+  "long_run_flag_used": false,
+  "would_refuse_without_long_flag": false,
+  "thresholds": {
+    "max_error_rate_pct": 15.0,
+    "max_turn_latency_s": 120.0,
+    "max_p95_latency_s": 180.0,
+    "max_rss_growth_pct": 50.0,
+    "require_recovered": true
+  }
+}
+[dry-run] no request sent, no metric collected.
+exit=0
+
+$ .venv/bin/python scripts/soak_runner.py --scenario stable --turns 501 --dry-run   # tu choi qua nguong 500 turn
+error: refusing to run 501 turns without --i-know-this-is-long
+exit=2
