@@ -14,10 +14,10 @@ def test_token_bundle_roundtrip(tmp_path: Path):
     )
     mgr = TokenCacheManager(cache_dir=tmp_path)
     mgr.save_disk_cache(bundle)
-    
+
     assert cache_file.exists()
     assert (cache_file.stat().st_mode & 0o777) == 0o600
-    
+
     loaded = mgr.load_disk_cache()
     assert loaded is not None
     assert loaded.access_token == "test_token_12345"

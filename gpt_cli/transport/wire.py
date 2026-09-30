@@ -6,6 +6,7 @@ from typing import Any, Callable
 from curl_cffi.requests import AsyncSession
 from ..core.types import TokenBundle, TurnResult
 from ..config import defaults
+from ..config.settings import Settings
 from ..models.registry import ModelRegistry
 from .conduit import ConduitHandshake
 
@@ -27,6 +28,8 @@ class WireTransport:
     ) -> dict[str, Any]:
         model_def = ModelRegistry.resolve(model_alias)
         chosen_effort = effort or model_def.default_effort
+        if chosen_effort not in ("extended", "standard"):
+            chosen_effort = "standard" if chosen_effort in ("low", "none", "off", "min", "medium") else "extended"
 
         msg_id = str(uuid.uuid4())
         payload: dict[str, Any] = {
@@ -39,23 +42,25 @@ class WireTransport:
                 }
             ],
             "model": model_def.slug,
-            "parent_message_id": parent_id or str(uuid.uuid4()),
+            "parent_message_id": parent_id or "client-created-root",
             "conversation_mode": {"kind": "primary_assistant"},
         }
         if model_def.supports_thinking:
             payload["thinking_effort"] = chosen_effort
-        if conversation_id:
+        if conversation_id and parent_id and parent_id != "client-created-root":
             payload["conversation_id"] = conversation_id
+        else:
+            payload["parent_message_id"] = "client-created-root"
         return payload
 
     async def _send_once(
         self,
         prompt: str,
-        conversation_id: str | None,
-        parent_id: str | None,
-        model_alias: str | None,
-        effort: str | None,
-        on_event: Callable[[Any], None] | None,
+        conversation_id: str | None = None,
+        parent_id: str | None = None,
+        model_alias: str | None = None,
+        effort: str | None = None,
+        on_event: Callable[[Any], None] | None = None,
     ) -> TurnResult:
         model_def = ModelRegistry.resolve(model_alias)
         t0 = time.perf_counter()
@@ -66,7 +71,8 @@ class WireTransport:
             self.bundle,
             model_slug=model_def.slug,
             user_agent=self.user_agent,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            parent_id=parent_id,
         )
 
         # Step 2: Build Payload
@@ -79,20 +85,35 @@ class WireTransport:
         )
 
         # Step 3: Post Conversation Stream
+        timeout_sec = Settings().timeout_seconds
         response = await self.session.post(
             defaults.FCONV_CONVERSATION_URL,
             headers=headers,
             json=payload,
             stream=True,
-            timeout=defaults.DEFAULT_TIMEOUT_SECONDS
+            timeout=timeout_sec
         )
 
         if response.status_code != 200:
             error_body = ""
-            try:
-                error_body = (await response.text())[:300]
-            except Exception:
-                pass
+            if hasattr(response, "aiter_content"):
+                try:
+                    chunks = []
+                    async for chunk in response.aiter_content():
+                        chunks.append(chunk)
+                    raw_bytes = b"".join(chunks)
+                    error_body = raw_bytes.decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+            if not error_body and hasattr(response, "text"):
+                try:
+                    error_body = (response.text or "")[:500]
+                except Exception:
+                    pass
+            import logging
+            logging.getLogger("gpt_cli.wire").error(
+                f"POST {response.status_code}: {error_body} | conv_id={conversation_id} | parent_id={parent_id} | payload={json.dumps(payload)[:400]}"
+            )
             raise RuntimeError(f"ChatGPT Web POST returned HTTP {response.status_code}: {error_body}")
 
         # Step 4: Stream SSE and Parse
@@ -101,6 +122,7 @@ class WireTransport:
         last_msg_id = parent_id or ""
         resolved_model = model_def.slug
         is_done = False
+        stream_err: Exception | None = None
 
         from ..telemetry.parser import SSETelemetryParser
         parser = SSETelemetryParser()
@@ -119,14 +141,14 @@ class WireTransport:
                         captured_conv_id = ev.data.get("conversation_id")
                     elif ev.event_type == "message_id":
                         last_msg_id = ev.data.get("message_id")
+                    elif ev.event_type == "error":
+                        stream_err = RuntimeError(f"Upstream SSE error: {ev.data.get('error')}")
                     elif ev.event_type == "done":
                         is_done = True
                 if is_done:
                     break
-        except Exception:
-            # If server terminated socket after sending text or done signal, ignore premature close
-            if not full_text:
-                raise
+        except Exception as exc:
+            stream_err = exc
 
         for ev in parser.finish():
             if on_event:
@@ -139,14 +161,22 @@ class WireTransport:
                 captured_conv_id = ev.data.get("conversation_id")
             elif ev.event_type == "message_id":
                 last_msg_id = ev.data.get("message_id")
+            elif ev.event_type == "done":
+                is_done = True
+
+        if stream_err and not full_text:
+            raise stream_err
 
         t1 = time.perf_counter()
+        turn_status = "completed" if is_done else ("incomplete" if full_text else "failed")
         return TurnResult(
             text="".join(full_text),
             conversation_id=captured_conv_id or "",
             message_id=last_msg_id,
             model=resolved_model,
-            duration_ms=int((t1 - t0) * 1000)
+            duration_ms=int((t1 - t0) * 1000),
+            status=turn_status,
+            error=str(stream_err) if stream_err else None
         )
 
     async def send_turn(
@@ -162,7 +192,7 @@ class WireTransport:
         last_err: Exception | None = None
         for attempt in range(max_retries):
             try:
-                return await self._send_once(
+                res = await self._send_once(
                     prompt=prompt,
                     conversation_id=conversation_id,
                     parent_id=parent_id,
@@ -170,8 +200,26 @@ class WireTransport:
                     effort=effort,
                     on_event=on_event,
                 )
+                if res.status == "incomplete" and attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                return res
             except Exception as e:
                 last_err = e
+                err_msg = str(e)
+                if ("HTTP 401" in err_msg or "HTTP 403" in err_msg) and attempt == 0:
+                    try:
+                        from .lifebuoy import BrowserLifebuoy
+                        from ..core.token_cache import TokenCacheManager
+                        lifebuoy = BrowserLifebuoy(TokenCacheManager())
+                        self.bundle = await lifebuoy.remint_credentials(headless=True)
+                        continue
+                    except Exception:
+                        pass
+                if ("HTTP 404" in err_msg or "HTTP 422" in err_msg or "conversation_not_found" in err_msg) and conversation_id and attempt == 0:
+                    conversation_id = None
+                    parent_id = None
+                    continue
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5 * (attempt + 1))
                 else:

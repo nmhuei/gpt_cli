@@ -8,7 +8,7 @@ from gpt_cli.transport.lifebuoy import BrowserLifebuoy
 async def test_lifebuoy_triggers_refresh(tmp_path: Path):
     cache_mgr = TokenCacheManager(tmp_path)
     lifebuoy = BrowserLifebuoy(cache_mgr)
-    
+
     with patch.object(lifebuoy, "_extract_from_page", new_callable=AsyncMock) as mock_extract:
         mock_extract.return_value = {
             "accessToken": "new_refreshed_token_xyz",
@@ -20,7 +20,7 @@ async def test_lifebuoy_triggers_refresh(tmp_path: Path):
         assert bundle.access_token == "new_refreshed_token_xyz"
         assert bundle.cf_clearance == "new_clearance_123"
         assert bundle.oai_device_id == "new_dev_uuid"
-        
+
         # Verify saved to disk
         loaded = cache_mgr.load_disk_cache()
         assert loaded is not None

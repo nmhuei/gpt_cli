@@ -1,6 +1,6 @@
 ---
 name: gpt-cli
-description: Use when needing to invoke, automate, control, or troubleshoot the local `gpt-cli` tool (ChatGPT-Web Wire Conduit runtime), run prompts with `gpt-5-6-thinking` (0 MB browser RAM), manage tool-specific sessions, start/stop the background gateway, or diagnose, fix bugs, and improve the codebase at `/home/light/GitHub/gpt_cli`.
+description: Use when needing to invoke, automate, control, or troubleshoot the local `gpt-cli` tool (ChatGPT-Web Wire Conduit runtime), run prompts with `gpt-5-6-thinking` (0 MB browser RAM), chat interactively with `gpt`, manage tool-specific sessions, start/stop the background gateway (OpenAI & Anthropic API), or diagnose, fix bugs, and improve the codebase at `/home/light/GitHub/gpt_cli`.
 ---
 
 # GPT-CLI Tool & Maintenance Guide
@@ -11,17 +11,31 @@ description: Use when needing to invoke, automate, control, or troubleshoot the 
 
 - **Vị trí Source Code:** [`/home/light/GitHub/gpt_cli`](file:///home/light/GitHub/gpt_cli)
 - **Virtual Environment Python:** `/home/light/GitHub/gpt_cli/.venv/bin/python` (Python 3.14.5)
-- **Token Cache:** `~/.local/share/webgpt/profiles/personal/webgpt-token-cache.json` (quyền 0600)
+- **Launcher trong PATH:** [`/home/light/.local/bin/gpt`](file:///home/light/.local/bin/gpt)
+- **Token Cache:** `~/.local/share/webgpt/profiles/personal/webgpt-token-cache.json` (quyền `0600`)
 - **Sessions Storage:** `~/.local/share/webgpt/sessions/tool_sessions.json`
+- **Granular Session Logs:** `~/.local/share/webgpt/sessions/<session_id>/` (`history.jsonl`, `events.jsonl`)
 - **Telemetry & Gateway Logs:** `~/.local/share/webgpt/logs/` (`live_telemetry.jsonl`, `gateway.log`)
+- **Systemd User Service:** `webgpt-gateway.service` (chạy micro gateway ASGI trên port 18000)
 
 ---
 
-## 1. Quick Reference: Lệnh CLI Cơ Bản (Machine-First)
+## 1. Quick Reference: Lệnh CLI Cơ Bản (Machine-First & Interactive)
 
 Mọi lệnh CLI đều hỗ trợ cờ `--json` để AI agent dễ dàng parse kết quả.
 
-### Gửi Prompt & Nối tiếp Hội thoại (DAG Continuity)
+### Chế độ Chat Tương Tác & Gửi Prompt Trực Tiếp
+
+```bash
+# 1. Mở giao diện chat tương tác trực tiếp trong terminal (hỗ trợ /new, /session, /exit)
+gpt
+# hoặc: gpt chat
+
+# 2. Gửi nhanh một prompt và stream kết quả ngay lập tức
+gpt "Xin chào, hãy giải thích ngắn gọn thuật toán RSA"
+```
+
+### Gửi Prompt & Nối Tiếp Hội Thoại (DAG Continuity)
 
 ```bash
 # 1. Chạy prompt tiếp nối trong session đang active (tự duy trì parent_message_id)
@@ -37,9 +51,13 @@ gpt run -p "Tiếp tục bài trước" -s "sess_e3affde1" --json
 gpt run -p "Câu hỏi khó" -e "extended" --json
 ```
 
-### Quản lý Session
+### Quản Lý Session & Xem Log Debug Phục Vụ Phân Tích
 
 Tool **chỉ quản lý các session do chính tool tạo** trong `tool_sessions.json`, tuyệt đối không can thiệp hay làm rác các đoạn chat cá nhân khác của người dùng.
+
+Mỗi session được lưu trữ tách biệt tại thư mục `~/.local/share/webgpt/sessions/<local_id>/`:
+- `history.jsonl`: Lưu toàn bộ lịch sử turn (prompt, response text, model, duration_ms, thinking thoughts, tool calls, error nếu có).
+- `events.jsonl`: Lưu chuỗi SSE events dạng thô thời gian thực phục vụ phân tích sâu.
 
 ```bash
 # Xem danh sách session (kèm số turns, tag, ngày cập nhật)
@@ -68,27 +86,29 @@ gpt session log sess_e3affde1 --turn 2
 gpt session delete sess_e3affde1
 ```
 
-### Quản lý Gateway Nền (Tương thích OpenAI API)
+### Quản Lý Gateway Nền (Tương Thích Cả OpenAI & Anthropic Messages API)
 
-Micro Gateway ASGI Starlette chạy ngầm phục vụ chuẩn `/v1/chat/completions`:
+Micro Gateway ASGI Starlette chạy ngầm phục vụ chuẩn:
+- `POST /v1/chat/completions` (OpenAI format, hỗ trợ stream)
+- `POST /v1/messages` (Anthropic Messages format, hỗ trợ stream)
+- `GET /healthz` & `GET /v1/models`
 
 ```bash
-# Khởi động gateway nền (mặc định port 18000)
+# Quản lý qua systemd (khuyên dùng vì tự khởi động cùng máy):
+systemctl --user status webgpt-gateway.service
+systemctl --user restart webgpt-gateway.service
+systemctl --user stop webgpt-gateway.service
+
+# Hoặc quản lý trực tiếp bằng CLI:
 gpt start --port 18000
-
-# Kiểm tra trạng thái gateway
 gpt status --json
-
-# Tắt gateway
 gpt stop
-
-# Khởi động lại gateway
 gpt restart --port 18000
 ```
 
 ---
 
-## 2. Sử dụng Trực tiếp trong Code Python (Python In-Code)
+## 2. Sử Dụng Trực Tiếp Trong Code Python (Python In-Code)
 
 Khi viết solver script hoặc tool con cần gọi GPT không qua CLI:
 
@@ -97,6 +117,7 @@ import asyncio
 from gpt_cli.core.token_cache import TokenCacheManager
 from gpt_cli.transport.wire import WireTransport
 from gpt_cli.session.registry import SessionRegistry
+from gpt_cli.session.logger import SessionLogManager
 
 async def ask_gpt(prompt: str, session_tag: str = "worker"):
     # 1. Đọc token từ cache đĩa an toàn
@@ -108,6 +129,7 @@ async def ask_gpt(prompt: str, session_tag: str = "worker"):
     # 2. Lấy hoặc tạo session
     reg = SessionRegistry()
     sess = reg.get_or_create(tag=session_tag)
+    log_mgr = SessionLogManager()
 
     # 3. Gửi turn qua WireTransport (0 MB RAM)
     async with WireTransport(bundle) as transport:
@@ -119,7 +141,19 @@ async def ask_gpt(prompt: str, session_tag: str = "worker"):
             effort="extended"
         )
 
-    # 4. Cập nhật cây DAG session
+    # 4. Ghi log turn
+    log_mgr.log_turn(
+        local_id=sess.local_id,
+        turn_index=sess.turns + 1,
+        prompt=prompt,
+        response=result.text,
+        model=result.model,
+        duration_ms=result.duration_ms,
+        conversation_id=result.conversation_id,
+        message_id=result.message_id
+    )
+
+    # 5. Cập nhật cây DAG session
     reg.update_turn(
         local_id=sess.local_id,
         conversation_id=result.conversation_id,
@@ -149,7 +183,7 @@ async def worker(prompt):
 
 ---
 
-## 3. Bản đồ Kiến trúc Codebase (Dành cho Agent Sửa Lỗi)
+## 3. Bản Đồ Kiến Trúc Codebase (Dành Cho Agent Sửa Lỗi)
 
 Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file theo ranh giới sau:
 
@@ -164,13 +198,14 @@ Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file
 | [`gpt_cli/telemetry/parser.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/telemetry/parser.py) | Bóc tách SSE stream (thoughts, commentary, tools, deltas, done) |
 | [`gpt_cli/transport/lifebuoy.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/lifebuoy.py) | Chromium ngủ đông, chỉ mở 3s re-mint credentials khi 403 |
 | [`gpt_cli/session/registry.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/session/registry.py) | Quản lý `tool_sessions.json`, lưu cây DAG message |
+| [`gpt_cli/session/logger.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/session/logger.py) | Quản lý lưu log `history.jsonl` và `events.jsonl` theo session |
 | [`gpt_cli/pool/worker_pool.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/pool/worker_pool.py) | Giới hạn concurrency `asyncio.Semaphore(5)` |
-| [`gpt_cli/server/app.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/server/app.py) | Micro Gateway Starlette tương thích `/v1/chat/completions` |
-| [`gpt_cli/cli/main.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/cli/main.py) | Entrypoint CLI `gpt run`, `gpt session`, `gpt start/stop` |
+| [`gpt_cli/server/app.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/server/app.py) | Micro Gateway Starlette tương thích `/v1/chat/completions` & `/v1/messages` |
+| [`gpt_cli/cli/main.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/cli/main.py) | Entrypoint CLI `gpt`, `gpt run`, `gpt session`, `gpt start/stop` |
 
 ---
 
-## 4. Cẩm nang Chẩn đoán & Tự Sửa Lỗi (Agent Troubleshooting & Self-Healing)
+## 4. Cẩm Nang Chẩn Đoán & Tự Sửa Lỗi (Agent Troubleshooting & Self-Healing)
 
 ### Lỗi 1: HTTP 403 Forbidden / Token Hết Hạn / Cloudflare Clearance Stale
 - **Triệu chứng:** `RuntimeError: ChatGPT Web POST returned HTTP 403: ...` hoặc Sentinel prepare trả về 403.
@@ -185,13 +220,26 @@ Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file
      lifebuoy = BrowserLifebuoy(cache_mgr)
      bundle = await lifebuoy.remint_credentials(headless=True)
      ```
-  2. Nếu headless thất bại do Cloudflare hCAPTCHA/Turnstile tương tác người dùng, mở trình duyệt bằng script profile để đăng nhập lại:
+  2. Nếu headless thất bại do Cloudflare Turnstile tương tác người dùng, mở trình duyệt bằng script profile để đăng nhập lại:
      ```bash
      cd /home/light/GitHub/gpt_cli
      .venv/bin/python -m gpt_cli.transport.lifebuoy --interactive
      ```
 
-### Lỗi 2: Sentinel Chat-Requirements Prepare Thất Bại (HTTP 400 hoặc No Token)
+### Lỗi 2: HTTP 404 Not Found Trên URL `http://127.0.0.1:18000/v1/messages`
+- **Triệu chứng:** `HTTPStatusError: Client error '404 Not Found' for url 'http://127.0.0.1:18000/v1/messages'`
+- **Nguyên nhân:** Tool cũ hoặc tiến trình gateway cũ (ở repo `/home/light/GitHub/gpt`) đang chạy chiếm cổng 18000 thay vì repo mới `gpt_cli`.
+- **Cách khắc phục:**
+  ```bash
+  # 1. Khởi động lại service gateway qua systemd:
+  systemctl --user daemon-reload
+  systemctl --user restart webgpt-gateway.service
+
+  # 2. Kiểm tra lại launcher:
+  which gpt # Đảm bảo trỏ về /home/light/.local/bin/gpt thực thi gpt_cli
+  ```
+
+### Lỗi 3: Sentinel Chat-Requirements Prepare Thất Bại (HTTP 400 hoặc No Token)
 - **Triệu chứng:** `ProtocolChanged: Sentinel chat-requirements prepare failed`.
 - **Nguyên nhân:** OpenAI thay đổi `_SENTINEL_BUILD_HASH` hoặc định dạng fingerprint.
 - **Kiểm tra & Sửa chữa:**
@@ -199,7 +247,7 @@ Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file
   2. Kiểm tra hằng số `_SENTINEL_BUILD_HASH` (ví dụ `prod-a696433ddfe0489db6696cae8c5778c2128f26e8`). Nếu OpenAI deploy build mới, inspect header `oai-client-version` từ traffic web để update hash này.
   3. Đảm bảo User-Agent trong [`defaults.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/config/defaults.py) và Client Hints `sec-ch-ua-platform: "Windows"` hoàn toàn đồng nhất.
 
-### Lỗi 3: Stream Bị Đứt Trước Khi Sinh Xong Text (Empty Response / IncompleteRead)
+### Lỗi 4: Stream Bị Đứt Trước Khi Sinh Xong Text (Empty Response / IncompleteRead)
 - **Triệu chứng:** Response trả về rỗng `""` hoặc gặp lỗi `IncompleteRead` / `HTTP/2 stream reset (error 0x2)`.
 - **Nguyên nhân:** Server đóng stream sớm hoặc parser bắt nhầm tín hiệu kết thúc từ frame trung gian.
 - **Lưu ý đã fix:** 
@@ -209,23 +257,11 @@ Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file
     - Tin nhắn assistant có `content_type == "text"` và status thuộc `COMPLETION_STATUSES`.
   - [`gpt_cli/transport/wire.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/wire.py) đã trang bị cơ chế tự động thử lại (max 2 retries) khi gặp ngắt kết nối mạng thoáng qua.
 
-### Lỗi 4: Xung đột Port 18000 khi Khởi Động Gateway
-- **Triệu chứng:** `gpt start` không bind được port 18000 do tiến trình cũ đang chiếm.
-- **Cách khắc phục:**
-  ```bash
-  # Tìm và kill tiến trình cũ đang chiếm port
-  lsof -i :18000
-  kill -9 <PID>
-  
-  # Hoặc khởi động gateway trên port khác:
-  gpt start --port 18001
-  ```
-
 ---
 
-## 5. Quy trình Kiểm thử Toàn diện (Verification Workflow)
+## 5. Quy Trình Kiểm Thử Toàn Diện (Verification Workflow)
 
-Sau khi chỉnh sửa bất kỳ code nào trong repo [`/home/light/GitHub/gpt_cli`](file:///home/light/GitHub/gpt_cli), bắt buộc chạy quy trình xác minh 2 bước:
+Sau khi chỉnh sửa bất kỳ code nào trong repo [`/home/light/GitHub/gpt_cli`](file:///home/light/GitHub/gpt_cli), bắt buộc chạy quy trình xác minh:
 
 ```bash
 cd /home/light/GitHub/gpt_cli
@@ -236,4 +272,38 @@ cd /home/light/GitHub/gpt_cli
 # Bước 2: Chạy kiểm thử Live 5 Workers Concurrency
 .venv/bin/pytest tests/test_e2e_live.py -v -s
 ```
-Chỉ coi là hoàn thành khi toàn bộ 22+ tests đều **PASS 100%**.
+Chỉ coi là hoàn thành khi toàn bộ 45+ tests đều **PASS 100%**.
+
+---
+
+## 6. Hợp Nhất Với DeepSeek Harness (`@deepseek-ai/dsh`) & Agent Harnesses
+
+`gpt_cli` đóng vai trò là backend suy luận cục bộ siêu tốc (0 MB browser RAM) cho **DeepSeek Harness** (`dsh`) và các agent harness chuẩn Anthropic Messages API / OpenAI Chat Completions.
+
+### 6.1. Đặc Tính Kỹ Thuật Nổi Bật:
+1. **Native Chain-of-Thought (CoT) Không Ép Buộc Prompt:**
+   - Hoàn toàn không nhồi prompt template XML/JSON làm hỏng logic CoT tự nhiên của `gpt-5-6-thinking`.
+   - Streaming chuẩn Anthropic Messages: phát trực tiếp block `thinking` (`thinking_delta`) để DeepSeek Harness hiển thị khung suy luận gập mở (`dsh: reasoning:`).
+2. **Bộ Phân Giải Tên Tool Trong Suốt (`_resolve_tool_name`):**
+   - Tự động chuyển đổi các namespace tool của ChatGPT Web (`functions.exec`, `api_tool.call_tool (health_check)`) sang đúng tên tool harness đăng ký (`bash`, `health_check`, `execute_command`...) và unwrap tham số lồng nhau.
+3. **Duy Trì Hội Thoại Đa Lượt Cây DAG (Native Session Continuity):**
+   - Tự động bắt `x-deepseek-harness-session-id` từ DeepSeek Harness.
+   - Lượt 1 khởi tạo conversation; các lượt sau chỉ gửi đúng tin nhắn mới nhất (`messages[-1]`) gắn với `parent_id`, tiết kiệm 95% token và giữ trọn bộ nhớ hội thoại.
+
+### 6.2. Các Lệnh Khởi Chạy DeepSeek Harness:
+
+```bash
+# Thiết lập biến môi trường trỏ về gateway gpt_cli
+export DEEPSEEK_BASE_URL="http://127.0.0.1:18000"
+export DEEPSEEK_API_KEY="sk-webgpt-local"
+
+# 1. Chế độ dòng lệnh đơn lượt (Headless)
+npx @deepseek-ai/dsh headless "mcp còn sống k"
+
+# 2. Chế độ Terminal Tương Tác (TUI)
+npx @deepseek-ai/dsh tui
+
+# 3. Chế độ Giao Diện Web (Web UI trên cổng 3080)
+npx @deepseek-ai/dsh web --no-open --port 3080
+```
+

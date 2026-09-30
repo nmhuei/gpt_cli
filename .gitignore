@@ -36,3 +36,5 @@ live_telemetry.jsonl
 tool_sessions.json
 gateway.pid
 *.log
+.env
+.env.*

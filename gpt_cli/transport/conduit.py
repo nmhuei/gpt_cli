@@ -1,6 +1,8 @@
 import asyncio
 import os
 import uuid
+import time
+import calendar
 from typing import Any
 from curl_cffi.requests import AsyncSession
 from ..core.types import TokenBundle
@@ -81,6 +83,7 @@ class ConduitHandshake:
         model_slug: str,
         user_agent: str | None = None,
         conversation_id: str | None = None,
+        parent_id: str | None = None,
     ) -> tuple[dict[str, str], str, str, str | None]:
         ua = user_agent or defaults.DEFAULT_USER_AGENT
         turn_session_id = str(uuid.uuid4())
@@ -131,11 +134,37 @@ class ConduitHandshake:
             requirements_token=token, proof_token=proof_token,
             use_prepare_header=is_prepare_stage
         )
-        prep_body = {
+        conduit_headers["X-Conduit-Token"] = "no-token"
+
+        ts = time.time()
+        local = time.localtime(ts)
+        tz_offset = round((calendar.timegm(local) - int(ts)) / 60.0)
+
+        prep_body: dict[str, Any] = {
+            "action": "next",
+            "client_contextual_info": {
+                "app_name": "chatgpt.com",
+                "has_web_push_capabilities": False,
+                "web_push_notification_permission": "default",
+            },
+            "client_prepare_dispatch": "conversation",
+            "client_prepare_source": "chatgpt_web_client",
+            "client_prepare_state": "none",
+            "conversation_mode": {"kind": "primary_assistant"},
+            "local_function_names": [],
             "model": model_slug,
-            "conversation_id": conversation_id,
+            "parent_message_id": parent_id or "client-created-root",
             "supported_encodings": ["v1"],
+            "supports_buffering": True,
+            "system_hints": [],
+            "timezone": "Asia/Ho_Chi_Minh",
+            "timezone_offset_min": tz_offset,
         }
+        if conversation_id and parent_id and parent_id != "client-created-root":
+            prep_body["conversation_id"] = conversation_id
+        else:
+            prep_body["parent_message_id"] = "client-created-root"
+
         prep_resp = await session.post(
             defaults.FCONV_PREPARE_URL,
             headers=conduit_headers,

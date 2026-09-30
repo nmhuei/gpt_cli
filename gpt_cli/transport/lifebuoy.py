@@ -49,8 +49,11 @@ class BrowserLifebuoy:
                 )
                 data = await self._extract_from_page(page)
                 cookies = data.get("cookies", {})
+                token = data.get("accessToken") or ""
+                if not token:
+                    raise RuntimeError("BrowserLifebuoy failed: Empty access token returned from browser session")
                 bundle = TokenBundle(
-                    access_token=data.get("accessToken") or "",
+                    access_token=token,
                     cookies=cookies,
                     oai_device_id=data.get("oaiDeviceId") or cookies.get("oai-device-id"),
                     cf_clearance=data.get("cfClearance") or cookies.get("cf_clearance"),

@@ -22,3 +22,12 @@ FCONV_CONVERSATION_URL = "https://chatgpt.com/backend-api/f/conversation"
 # User-Agent matching impersonated Chrome/146 on Windows
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
+# Models & Preferences
+DEFAULT_MODEL = "gpt-5-6-thinking"
+DEFAULT_EFFORT = "extended"
+
+# Bridge & MCP Settings
+DEFAULT_BRIDGE_NAME = "brige"
+DEFAULT_MCP_PERMISSION = "full_access"
+DEFAULT_MCP_TUNNEL_FILE = Path("/home/light/GitHub/botquanganh_mcp/logs/tunnel_url.txt")
+
