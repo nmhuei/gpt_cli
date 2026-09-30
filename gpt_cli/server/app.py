@@ -391,10 +391,12 @@ async def anthropic_messages(request: Request) -> Response:
     system_text = _extract_content(body.get("system", ""))
     tools = body.get("tools", [])
     registered_tools = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
-    print(f"[GATEWAY] POST /v1/messages: msgs={len(messages)}, registered_tools={list(registered_tools)}, system_len={len(system_text)}", flush=True)
+    header_keys = {k: v for k, v in request.headers.items() if k.lower() not in ("authorization", "cookie")}
+    print(f"[GATEWAY] POST /v1/messages: msgs={len(messages)}, registered_tools={list(registered_tools)}, system_len={len(system_text)}, headers={header_keys}", flush=True)
 
     session_key = (
         request.headers.get("x-deepseek-harness-session-id")
+        or request.headers.get("x-claude-code-session-id")
         or request.headers.get("x-session-id")
         or request.headers.get("x-conversation-id")
         or (body.get("metadata") or {}).get("session_id")
@@ -511,7 +513,7 @@ async def anthropic_messages(request: Request) -> Response:
 
         has_tool = bool(captured_tools)
         has_text = bool(result.text.strip())
-        stop_reason = "tool_use" if (has_tool and not has_text) else "end_turn"
+        stop_reason = "tool_use" if has_tool else "end_turn"
 
         return JSONResponse({
             "id": msg_id,

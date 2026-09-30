@@ -282,6 +282,37 @@ def test_anthropic_messages_multi_turn_session_continuity(monkeypatch, tmp_path)
     assert "How are you?" in call_history[1]["prompt"]
     assert "Hello" not in call_history[1]["prompt"]
 
+    # Turn 3 with x-claude-code-session-id
+    res3 = client.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": "claude_unit_test"},
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": [{"role": "user", "content": "First message"}]
+        }
+    )
+    assert res3.status_code == 200
+    assert call_history[2]["conv_id"] is None
+
+    # Turn 4 continuation with x-claude-code-session-id
+    res4 = client.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": "claude_unit_test"},
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": [
+                {"role": "user", "content": "First message"},
+                {"role": "assistant", "content": "Answer"},
+                {"role": "user", "content": "Second message"}
+            ]
+        }
+    )
+    assert res4.status_code == 200
+    assert call_history[3]["conv_id"] == "chatgpt_conv_99"
+    assert call_history[3]["parent_id"] == "msg_node_3"
+    assert "Second message" in call_history[3]["prompt"]
+    assert "First message" not in call_history[3]["prompt"]
+
 def test_resolve_tool_name_mcp_namespacing():
     from gpt_cli.server.app import _resolve_tool_name
     registered = {"bash", "glob", "read", "mcp__br__health_check", "mcp__br__host_run_command"}
