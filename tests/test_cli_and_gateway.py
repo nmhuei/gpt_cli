@@ -282,4 +282,25 @@ def test_anthropic_messages_multi_turn_session_continuity(monkeypatch, tmp_path)
     assert "How are you?" in call_history[1]["prompt"]
     assert "Hello" not in call_history[1]["prompt"]
 
+def test_resolve_tool_name_mcp_namespacing():
+    from gpt_cli.server.app import _resolve_tool_name
+    registered = {"bash", "glob", "read", "mcp__br__health_check", "mcp__br__host_run_command"}
+
+    res, unwrap = _resolve_tool_name("api_tool.call_tool (health_check)", registered)
+    assert res == "mcp__br__health_check"
+    assert unwrap is True
+
+    res, unwrap = _resolve_tool_name("health_check", registered)
+    assert res == "mcp__br__health_check"
+    assert unwrap is False
+
+    res, unwrap = _resolve_tool_name("functions.exec", registered)
+    assert res == "bash"
+    assert unwrap is False
+
+    res, unwrap = _resolve_tool_name("host_list_directory", registered)
+    assert res == "glob"
+    assert unwrap is False
+
+
 

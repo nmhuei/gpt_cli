@@ -60,31 +60,50 @@ def _resolve_tool_name(raw_name: str, registered: set[str]) -> tuple[str, bool]:
         ("host_replace_in_file", "edit_file", "replace_file_content"): ("edit", "edit_file", "str_replace_editor"),
         ("host_search_text", "search_text", "grep"): ("grep", "fs_search", "search"),
     }
+    for reg in registered:
+        if reg.endswith(f"__{raw_name}"):
+            return reg, False
+
     for sources, targets in alias_map.items():
         if raw_name in sources:
             for cand in targets:
                 if cand in registered:
                     return cand, False
+                for reg in registered:
+                    if reg.endswith(f"__{cand}"):
+                        return reg, False
 
     if "(" in raw_name and ")" in raw_name:
         inner = raw_name.split("(", 1)[1].split(")", 1)[0].strip()
         if inner in registered:
             return inner, True
+        for reg in registered:
+            if reg.endswith(f"__{inner}"):
+                return reg, True
         for sources, targets in alias_map.items():
             if inner in sources:
                 for cand in targets:
                     if cand in registered:
                         return cand, True
+                    for reg in registered:
+                        if reg.endswith(f"__{cand}"):
+                            return reg, True
 
     if "." in raw_name:
         tail = raw_name.rsplit(".", 1)[1].strip()
         if tail in registered:
             return tail, True
+        for reg in registered:
+            if reg.endswith(f"__{tail}"):
+                return reg, True
         for sources, targets in alias_map.items():
             if tail in sources:
                 for cand in targets:
                     if cand in registered:
                         return cand, True
+                    for reg in registered:
+                        if reg.endswith(f"__{cand}"):
+                            return reg, True
 
     return raw_name, False
 
