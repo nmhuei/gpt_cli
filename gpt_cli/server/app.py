@@ -201,11 +201,54 @@ def _normalize_tool_payload(resolved_name: str, raw_payload: Any, should_unwrap:
 
     return obj
 
+def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> str:
+    """Prepend active bridge mention (e.g. '@br ') if not already present."""
+    p = prompt.strip()
+    if not bridge_name or str(bridge_name).lower() in ("off", "none", "false"):
+        return p
+    clean_bridge = str(bridge_name).lstrip("@").strip()
+    if not clean_bridge:
+        return p
+    if p.startswith(f"@{clean_bridge} ") or p == f"@{clean_bridge}":
+        return p
+    return f"@{clean_bridge} {p}"
+
+def _is_session_title_request(messages: list[dict[str, Any]], system_text: str = "") -> bool:
+    s_low = (system_text or "").lower()
+    if "concise title" in s_low or "session title" in s_low:
+        return True
+    for m in messages:
+        c = _extract_content(m.get("content", "")).lower()
+        if "generate the session title" in c or "concise title for an ai coding-assistant" in c:
+            return True
+    return False
+
+def _generate_local_session_title(messages: list[dict[str, Any]]) -> str:
+    import re
+    for m in messages:
+        c = _extract_content(m.get("content", ""))
+        if '"text":' in c:
+            try:
+                matches = re.findall(r'"text":\s*"([^"]+)"', c)
+                if matches:
+                    raw = matches[-1].strip()
+                    return " ".join(raw.split()[:6])
+            except Exception:
+                pass
+        lines = [line.strip() for line in c.splitlines() if line.strip()]
+        if lines:
+            first = lines[-1]
+            return " ".join(first.split()[:6])
+    return "Session"
+
 def format_chat_messages(
     messages: list[dict[str, Any]],
     system_prompt: str | None = None,
     tools: list[dict[str, Any]] | None = None,
 ) -> str:
+    if len(messages) == 1 and messages[0].get("role") == "user":
+        return _extract_content(messages[0].get("content", "")).strip()
+
     rendered: list[str] = []
     sys_sections: list[str] = []
     if system_prompt and system_prompt.strip():
@@ -224,9 +267,6 @@ def format_chat_messages(
     full_system = "\n\n".join(sys_sections)
     if full_system:
         rendered.append(f"[System Instruction]\n{full_system}")
-
-    if len(messages) == 1 and not rendered:
-        return _extract_content(messages[0].get("content", ""))
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -273,9 +313,23 @@ async def chat_completions(request: Request) -> Response:
     if not messages:
         return JSONResponse({"error": {"message": "Messages cannot be empty"}}, status_code=400)
 
-    prompt = format_chat_messages(messages)
     model_alias = body.get("model", "gpt-5-6-thinking")
     is_stream = bool(body.get("stream", False))
+
+    if _is_session_title_request(messages):
+        title = _generate_local_session_title(messages)
+        return JSONResponse({
+            "id": f"chatcmpl-title-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_alias,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": title}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })
+
+    settings = Settings()
+    prompt = format_chat_messages(messages)
+    prompt = resolve_prompt_with_bridge(prompt, settings.default_bridge_name)
 
     cache_mgr = TokenCacheManager()
     bundle = cache_mgr.load_disk_cache()
@@ -290,6 +344,7 @@ async def chat_completions(request: Request) -> Response:
                 return await transport.send_turn(
                     prompt=prompt,
                     model_alias=model_alias,
+                    effort="extended",
                 )
 
         result = await pool.execute(do_turn)
@@ -338,6 +393,14 @@ async def chat_completions(request: Request) -> Response:
                         "object": "chat.completion.chunk",
                         "choices": [{"index": 0, "delta": {"reasoning_content": "\n".join(new_th) + "\n"}, "finish_reason": None}]
                     })
+            elif ev.event_type == "reasoning_recap":
+                recap = ev.data.get("recap", "")
+                if recap:
+                    queue.put_nowait({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"reasoning_content": f"[{recap}]\n"}, "finish_reason": None}]
+                    })
             elif ev.event_type == "delta":
                 text = ev.data.get("text", "")
                 if text:
@@ -346,6 +409,43 @@ async def chat_completions(request: Request) -> Response:
                         "object": "chat.completion.chunk",
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
                     })
+            elif ev.event_type == "tool_call_started":
+                tool_label = ev.data.get("tool") or ev.data.get("name") or "tool"
+                payload = ev.data.get("payload") or ""
+                if isinstance(payload, (dict, list)):
+                    payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
+                else:
+                    try:
+                        p_obj = json.loads(payload)
+                        payload_str = json.dumps(p_obj, ensure_ascii=False, indent=2)
+                    except Exception:
+                        payload_str = str(payload)
+                tool_block = f"\n🔧 [Tool Call: {tool_label}]\n📥 Input:\n```json\n{payload_str}\n```\n"
+                queue.put_nowait({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"reasoning_content": tool_block}, "finish_reason": None}]
+                })
+            elif ev.event_type == "tool_call_finished":
+                output = ev.data.get("output") or ""
+                title = ev.data.get("title") or ""
+                if isinstance(output, (dict, list)):
+                    out_str = json.dumps(output, ensure_ascii=False, indent=2)
+                else:
+                    try:
+                        o_obj = json.loads(output)
+                        out_str = json.dumps(o_obj, ensure_ascii=False, indent=2)
+                    except Exception:
+                        out_str = str(output)
+                if len(out_str) > 3000:
+                    out_str = out_str[:3000] + f"\n... [truncated {len(out_str) - 3000} bytes]"
+                header = f"📤 Output ({title}):" if title else "📤 Output:"
+                tool_block = f"{header}\n```json\n{out_str}\n```\n\n"
+                queue.put_nowait({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"reasoning_content": tool_block}, "finish_reason": None}]
+                })
             elif ev.event_type == "done":
                 queue.put_nowait({
                     "id": completion_id,
@@ -359,6 +459,7 @@ async def chat_completions(request: Request) -> Response:
                     await transport.send_turn(
                         prompt=prompt,
                         model_alias=model_alias,
+                        effort="extended",
                         on_event=on_event
                     )
             finally:
@@ -389,6 +490,31 @@ async def anthropic_messages(request: Request) -> Response:
         return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": "Messages cannot be empty"}}, status_code=400)
 
     system_text = _extract_content(body.get("system", ""))
+    model_alias = body.get("model", "gpt-5-6-thinking")
+    is_stream = bool(body.get("stream", False))
+
+    if _is_session_title_request(messages, system_text):
+        title = _generate_local_session_title(messages)
+        if is_stream:
+            async def title_stream():
+                msg_id = f"msg_title_{uuid.uuid4().hex[:12]}"
+                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_alias, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 10, 'output_tokens': 5}}})}\n\n"
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': title}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 5}})}\n\n"
+                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+            return StreamingResponse(title_stream(), media_type="text/event-stream")
+        return JSONResponse({
+            "id": f"msg_title_{uuid.uuid4().hex[:12]}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": title}],
+            "model": model_alias,
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+
     tools = body.get("tools", [])
     registered_tools = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
     header_keys = {k: v for k, v in request.headers.items() if k.lower() not in ("authorization", "cookie")}
@@ -410,6 +536,7 @@ async def anthropic_messages(request: Request) -> Response:
         conv_id = sess.conversation_id
         parent_id = sess.last_message_id
 
+    settings = Settings()
     if conv_id and parent_id and len(messages) > 1:
         prompt = format_chat_messages(messages[-1:], tools=tools)
     else:
@@ -417,23 +544,8 @@ async def anthropic_messages(request: Request) -> Response:
         parent_id = None
         prompt = format_chat_messages(messages, system_prompt=system_text, tools=tools)
 
-    model_alias = body.get("model", "gpt-5-6-thinking")
-    is_stream = bool(body.get("stream", False))
-
-    effort = None
-    th_cfg = body.get("thinking")
-    out_cfg = body.get("output_config", {})
-    if isinstance(out_cfg, dict) and "effort" in out_cfg:
-        e = str(out_cfg.get("effort", "")).lower()
-        if e in ("high", "max"):
-            effort = "extended"
-        elif e in ("low", "min", "off", "none", "standard", "medium"):
-            effort = "standard"
-    elif isinstance(th_cfg, dict):
-        if th_cfg.get("type") == "disabled":
-            effort = "standard"
-        elif th_cfg.get("type") == "enabled":
-            effort = "extended"
+    prompt = resolve_prompt_with_bridge(prompt, settings.default_bridge_name)
+    effort = "extended"
 
     cache_mgr = TokenCacheManager()
     bundle = cache_mgr.load_disk_cache()
@@ -459,6 +571,10 @@ async def anthropic_messages(request: Request) -> Response:
                 title = ev.data.get("title")
                 if title and title not in captured_thinking:
                     captured_thinking.append(title)
+            elif ev.event_type == "reasoning_recap":
+                recap = ev.data.get("recap")
+                if recap and recap not in captured_thinking:
+                    captured_thinking.append(recap)
             elif ev.event_type == "tool_call_started":
                 call_id = ev.data.get("id") or ev.data.get("tool")
                 existing = next((t for t in captured_tools if (t.get("id") or t.get("tool")) == call_id), None)
@@ -625,6 +741,28 @@ async def anthropic_messages(request: Request) -> Response:
                         "delta": {"type": "thinking_delta", "thinking": th_text}
                     }))
 
+            elif ev.event_type == "reasoning_recap":
+                recap = ev.data.get("recap")
+                if recap and recap not in seen_thoughts:
+                    seen_thoughts.add(recap)
+                    th_text = f"[{recap}]\n"
+                    out_tokens += len(th_text.split())
+                    if current_block_type != "thinking":
+                        close_current_block()
+                        current_block_index += 1
+                        current_block_type = "thinking"
+                        last_block_type = "thinking"
+                        queue.put_nowait(("content_block_start", {
+                            "type": "content_block_start",
+                            "index": current_block_index,
+                            "content_block": {"type": "thinking", "thinking": ""}
+                        }))
+                    queue.put_nowait(("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": current_block_index,
+                        "delta": {"type": "thinking_delta", "thinking": th_text}
+                    }))
+
             elif ev.event_type == "tool_call_started":
                 call_id = ev.data.get("id") or ev.data.get("tool", "tool")
                 new_payload = ev.data.get("payload")
@@ -745,6 +883,7 @@ def create_app() -> Starlette:
     settings = Settings()
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
+        Route("/health", healthz, methods=["GET"]),
         Route("/v1/models", list_models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
         Route("/v1/messages", anthropic_messages, methods=["POST"]),

@@ -125,29 +125,44 @@ class SSETelemetryParser:
             elif role == "tool":
                 invoked = metadata.get("invoked_plugin") or metadata.get("invoked_resource") or {}
                 r_title = metadata.get("reasoning_title")
+                parts = content.get("parts", [])
+                output_text = parts[0] if parts else content.get("text", "")
                 events.append(TelemetryEvent(
                     event_type="tool_call_finished",
                     data={
+                        "id": msg_id,
                         "title": r_title,
                         "resource": invoked,
+                        "output": output_text,
                     }
                 ))
 
             # Tool call start (assistant invoking tool)
             elif (
                 recipient in {"functions.exec", "host_run_command", "bash", "python"}
-                or (isinstance(recipient, str) and (recipient.startswith("api_tool.") or "mcp" in recipient.lower()))
+                or (isinstance(recipient, str) and (
+                    recipient.startswith("api_tool.")
+                    or "mcp" in recipient.lower()
+                    or recipient.startswith("link_")
+                    or "br" in recipient.lower()
+                    or (recipient not in ("all", "final") and role == "assistant" and channel is None)
+                ))
             ):
                 parts = content.get("parts", [])
                 text_content = content.get("text", "")
                 tool_payload = parts[0] if parts else text_content
                 tool_label = recipient or author.get("name", "tool")
-                if isinstance(tool_payload, str) and '"path"' in tool_payload:
+                if isinstance(tool_payload, str):
                     try:
                         p_data = json.loads(tool_payload)
-                        if "path" in p_data:
-                            action_name = p_data["path"].split("/")[-1]
-                            tool_label = f"{tool_label} ({action_name})"
+                        if isinstance(p_data, dict):
+                            action_name = (
+                                p_data.get("action")
+                                or p_data.get("name")
+                                or (p_data.get("path", "").lstrip("/").split("/")[-1] if "path" in p_data else None)
+                            )
+                            if action_name:
+                                tool_label = action_name
                     except Exception:
                         pass
                 events.append(TelemetryEvent(

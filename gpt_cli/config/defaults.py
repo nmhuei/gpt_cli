@@ -27,7 +27,7 @@ DEFAULT_MODEL = "gpt-5-6-thinking"
 DEFAULT_EFFORT = "extended"
 
 # Bridge & MCP Settings
-DEFAULT_BRIDGE_NAME = "brige"
+DEFAULT_BRIDGE_NAME = "br"
 DEFAULT_MCP_PERMISSION = "full_access"
 DEFAULT_MCP_TUNNEL_FILE = Path("/home/light/GitHub/botquanganh_mcp/logs/tunnel_url.txt")
 
