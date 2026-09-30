@@ -266,16 +266,31 @@ async def interactive_chat(
                     sys.stdout.flush()
             elif ev.event_type == "tool_call_started":
                 captured_tools.append(ev.data)
-                tool_name = ev.data.get("tool", "tool")
-                if tool_name not in printed_telemetry:
-                    printed_telemetry.add(tool_name)
-                    sys.stdout.write(f"\033[36m🔧 [Tool] Calling {tool_name}...\033[0m\n")
+                call_id = ev.data.get("id")
+                if not call_id or call_id not in printed_telemetry:
+                    if call_id:
+                        printed_telemetry.add(call_id)
+                    tool_name = ev.data.get("tool", "tool")
+                    payload = ev.data.get("payload")
+                    payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, (dict, list)) else str(payload or "")
+                    sys.stdout.write(f"\n\033[36m🔧 [Tool Call: {tool_name}]\033[0m\n")
+                    if payload_str:
+                        sys.stdout.write(f"\033[2m📥 Input: {payload_str}\033[0m\n")
                     sys.stdout.flush()
             elif ev.event_type == "tool_call_finished":
-                title = ev.data.get("title")
-                if title and title not in printed_telemetry:
-                    printed_telemetry.add(title)
-                    sys.stdout.write(f"\033[36m🔧 [Tool Finished] {title}\033[0m\n")
+                call_id = ev.data.get("id")
+                fin_key = f"fin_{call_id}" if call_id else None
+                if not fin_key or fin_key not in printed_telemetry:
+                    if fin_key:
+                        printed_telemetry.add(fin_key)
+                    title = ev.data.get("title") or ""
+                    output = ev.data.get("output") or ""
+                    out_str = str(output)[:2000] if output else ""
+                    if len(str(output)) > 2000:
+                        out_str += f"\n... [truncated {len(str(output)) - 2000} bytes]"
+                    sys.stdout.write(f"\033[36m📤 [Tool Output{f': {title}' if title else ''}]\033[0m\n")
+                    if out_str:
+                        sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
                     sys.stdout.flush()
             elif ev.event_type == "web_search":
                 queries = ev.data.get("queries", [])
@@ -410,16 +425,31 @@ async def handle_run(args: argparse.Namespace) -> None:
                         sys.stdout.flush()
                 elif ev.event_type == "tool_call_started":
                     captured_tools.append(ev.data)
-                    tool_name = ev.data.get("tool", "tool")
-                    if tool_name not in printed_telemetry:
-                        printed_telemetry.add(tool_name)
-                        sys.stdout.write(f"\033[36m🔧 [Tool] Calling {tool_name}...\033[0m\n")
+                    call_id = ev.data.get("id")
+                    if not call_id or call_id not in printed_telemetry:
+                        if call_id:
+                            printed_telemetry.add(call_id)
+                        tool_name = ev.data.get("tool", "tool")
+                        payload = ev.data.get("payload")
+                        payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, (dict, list)) else str(payload or "")
+                        sys.stdout.write(f"\n\033[36m🔧 [Tool Call: {tool_name}]\033[0m\n")
+                        if payload_str:
+                            sys.stdout.write(f"\033[2m📥 Input: {payload_str}\033[0m\n")
                         sys.stdout.flush()
                 elif ev.event_type == "tool_call_finished":
-                    title = ev.data.get("title")
-                    if title and title not in printed_telemetry:
-                        printed_telemetry.add(title)
-                        sys.stdout.write(f"\033[36m🔧 [Tool Finished] {title}\033[0m\n")
+                    call_id = ev.data.get("id")
+                    fin_key = f"fin_{call_id}" if call_id else None
+                    if not fin_key or fin_key not in printed_telemetry:
+                        if fin_key:
+                            printed_telemetry.add(fin_key)
+                        title = ev.data.get("title") or ""
+                        output = ev.data.get("output") or ""
+                        out_str = str(output)[:2000] if output else ""
+                        if len(str(output)) > 2000:
+                            out_str += f"\n... [truncated {len(str(output)) - 2000} bytes]"
+                        sys.stdout.write(f"\033[36m📤 [Tool Output{f': {title}' if title else ''}]\033[0m\n")
+                        if out_str:
+                            sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
                         sys.stdout.flush()
                 elif ev.event_type == "web_search":
                     queries = ev.data.get("queries", [])
