@@ -302,5 +302,28 @@ def test_resolve_tool_name_mcp_namespacing():
     assert res == "glob"
     assert unwrap is False
 
+def test_normalize_tool_payload_bash_and_pruning():
+    from gpt_cli.server.app import _normalize_tool_payload
+
+    # Test Bash fallback from resource list with paths
+    raw = {"paths": ["/var/log", "/tmp"], "query": "noop"}
+    norm = _normalize_tool_payload("Bash", raw)
+    assert norm["command"] == "ls -la /var/log /tmp"
+    assert norm["description"] == "Run: ls -la /var/log /tmp"
+    assert "paths" not in norm
+    assert "query" not in norm
+
+    # Test Bash empty command safety
+    norm_empty = _normalize_tool_payload("Bash", {})
+    assert norm_empty["command"] == ""
+    assert norm_empty["description"] == "Execute command"
+
+    # Test Read dual path normalization
+    raw_read = {"file": "/etc/hosts"}
+    norm_read = _normalize_tool_payload("Read", raw_read)
+    assert norm_read["path"] == "/etc/hosts"
+    assert norm_read["file_path"] == "/etc/hosts"
+    assert "file" not in norm_read
+
 
 

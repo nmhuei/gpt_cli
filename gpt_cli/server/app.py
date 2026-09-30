@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import shlex
 import time
 import uuid
 from typing import Any
@@ -52,6 +53,10 @@ def _resolve_tool_name(raw_name: str, registered: set[str]) -> tuple[str, bool]:
     if not registered or raw_name in registered:
         return raw_name, False
 
+    reg_lower_map = {r.lower(): r for r in registered}
+    if raw_name.lower() in reg_lower_map:
+        return reg_lower_map[raw_name.lower()], False
+
     alias_map = {
         ("functions.exec", "bash", "host_run_command", "python", "terminal", "sh"): ("bash", "execute_command", "sh", "terminal", "run_command", "python"),
         ("host_list_directory", "list_directory", "dir_list", "ls", "api_tool.list_resources", "list_resources", "resources_list"): ("glob", "bash", "fs_list"),
@@ -60,49 +65,52 @@ def _resolve_tool_name(raw_name: str, registered: set[str]) -> tuple[str, bool]:
         ("host_replace_in_file", "edit_file", "replace_file_content"): ("edit", "edit_file", "str_replace_editor"),
         ("host_search_text", "search_text", "grep"): ("grep", "fs_search", "search"),
     }
+    raw_lower = raw_name.lower()
     for reg in registered:
-        if reg.endswith(f"__{raw_name}"):
+        if reg.lower().endswith(f"__{raw_lower}"):
             return reg, False
 
     for sources, targets in alias_map.items():
-        if raw_name in sources:
+        if raw_lower in sources:
             for cand in targets:
-                if cand in registered:
-                    return cand, False
+                if cand.lower() in reg_lower_map:
+                    return reg_lower_map[cand.lower()], False
                 for reg in registered:
-                    if reg.endswith(f"__{cand}"):
+                    if reg.lower().endswith(f"__{cand.lower()}"):
                         return reg, False
 
     if "(" in raw_name and ")" in raw_name:
         inner = raw_name.split("(", 1)[1].split(")", 1)[0].strip()
-        if inner in registered:
-            return inner, True
+        inner_lower = inner.lower()
+        if inner_lower in reg_lower_map:
+            return reg_lower_map[inner_lower], True
         for reg in registered:
-            if reg.endswith(f"__{inner}"):
+            if reg.lower().endswith(f"__{inner_lower}"):
                 return reg, True
         for sources, targets in alias_map.items():
-            if inner in sources:
+            if inner_lower in sources:
                 for cand in targets:
-                    if cand in registered:
-                        return cand, True
+                    if cand.lower() in reg_lower_map:
+                        return reg_lower_map[cand.lower()], True
                     for reg in registered:
-                        if reg.endswith(f"__{cand}"):
+                        if reg.lower().endswith(f"__{cand.lower()}"):
                             return reg, True
 
     if "." in raw_name:
         tail = raw_name.rsplit(".", 1)[1].strip()
-        if tail in registered:
-            return tail, True
+        tail_lower = tail.lower()
+        if tail_lower in reg_lower_map:
+            return reg_lower_map[tail_lower], True
         for reg in registered:
-            if reg.endswith(f"__{tail}"):
+            if reg.lower().endswith(f"__{tail_lower}"):
                 return reg, True
         for sources, targets in alias_map.items():
-            if tail in sources:
+            if tail_lower in sources:
                 for cand in targets:
-                    if cand in registered:
-                        return cand, True
+                    if cand.lower() in reg_lower_map:
+                        return reg_lower_map[cand.lower()], True
                     for reg in registered:
-                        if reg.endswith(f"__{cand}"):
+                        if reg.lower().endswith(f"__{cand.lower()}"):
                             return reg, True
 
     return raw_name, False
@@ -124,41 +132,72 @@ def _normalize_tool_payload(resolved_name: str, raw_payload: Any, should_unwrap:
     if should_unwrap and "args" in obj and isinstance(obj["args"], dict):
         obj = dict(obj["args"])
 
+    r_lower = resolved_name.lower()
+
     # Normalization for bash / command execution
-    if resolved_name in ("bash", "execute_command", "sh", "terminal", "run_command"):
+    if r_lower in ("bash", "execute_command", "sh", "terminal", "run_command"):
         if "command" not in obj:
-            cmd = obj.get("input") or obj.get("code") or obj.get("script") or str(raw_payload or "")
-            if isinstance(cmd, str):
-                cmd_str = cmd.strip()
-                if ("\n" in cmd_str or "import " in cmd_str or "def " in cmd_str) and not cmd_str.startswith(("python", "bash", "sh")):
-                    cmd_str = f"python3 -c {json.dumps(cmd_str)}"
-                obj["command"] = cmd_str
+            if "paths" in obj and isinstance(obj["paths"], list):
+                p_str = " ".join(shlex.quote(str(p)) for p in obj["paths"] if p)
+                obj["command"] = f"ls -la {p_str}" if p_str else "ls -la"
+            elif "pattern" in obj:
+                obj["command"] = f"ls -la {shlex.quote(str(obj['pattern']))}"
             else:
-                obj["command"] = str(cmd)
+                cmd = obj.get("input") or obj.get("code") or obj.get("script") or obj.get("cmd") or ""
+                if not cmd and isinstance(raw_payload, str) and raw_payload.strip() not in ("{}", "[]", ""):
+                    if not (raw_payload.strip().startswith("{") and raw_payload.strip().endswith("}")):
+                        cmd = raw_payload
+                if isinstance(cmd, str):
+                    cmd_str = cmd.strip()
+                    if ("\n" in cmd_str or "import " in cmd_str or "def " in cmd_str) and not cmd_str.startswith(("python", "bash", "sh")):
+                        cmd_str = f"python3 -c {json.dumps(cmd_str)}"
+                    obj["command"] = cmd_str
+                else:
+                    obj["command"] = str(cmd)
         if "description" not in obj:
-            first_line = str(obj.get("command", "")).strip().splitlines()[0][:60]
-            obj["description"] = f"Run: {first_line}" if first_line else "Execute command"
+            lines = str(obj.get("command", "")).strip().splitlines()
+            first_line = lines[0][:60] if lines else ""
+            obj["description"] = f"Run: {first_line}" if lines else "Execute command"
+        # Prune non-standard keys so strict tools like Claude Code's Bash don't reject
+        for k in ("paths", "query", "input", "code", "script", "cmd"):
+            obj.pop(k, None)
 
     # Normalization for glob / directory listing
-    elif resolved_name in ("glob", "fs_list"):
+    elif r_lower in ("glob", "fs_list"):
         if "pattern" not in obj:
             d = obj.get("path") or obj.get("directory") or obj.get("dir") or "."
             d_str = str(d).rstrip("/")
             obj["pattern"] = f"{d_str}/*" if d_str and d_str != "." else "*"
+        for k in ("directory", "dir"):
+            obj.pop(k, None)
 
-    # Normalization for file reading
-    elif resolved_name in ("read_file", "read"):
-        if "path" not in obj and "file" in obj:
-            obj["path"] = obj.pop("file")
-        elif "path" not in obj and "input" in obj:
-            obj["path"] = obj.pop("input")
+    # Normalization for file reading (dual path and file_path for Claude Code & dsh)
+    elif r_lower in ("read_file", "read"):
+        p = obj.get("file_path") or obj.get("path") or obj.get("file") or obj.get("input")
+        if p:
+            obj["path"] = str(p)
+            obj["file_path"] = str(p)
+        for k in ("file", "input"):
+            obj.pop(k, None)
 
     # Normalization for file writing
-    elif resolved_name in ("write_file", "write"):
-        if "path" not in obj and "file" in obj:
-            obj["path"] = obj.pop("file")
+    elif r_lower in ("write_file", "write"):
+        p = obj.get("file_path") or obj.get("path") or obj.get("file") or obj.get("input")
+        if p:
+            obj["path"] = str(p)
+            obj["file_path"] = str(p)
         if "content" not in obj:
             obj["content"] = obj.get("text") or obj.get("input") or ""
+        for k in ("file", "input", "text"):
+            obj.pop(k, None)
+
+    # Normalization for file editing
+    elif r_lower in ("edit_file", "edit", "str_replace_editor"):
+        p = obj.get("file_path") or obj.get("path") or obj.get("file")
+        if p:
+            obj["path"] = str(p)
+            obj["file_path"] = str(p)
+        obj.pop("file", None)
 
     return obj
 
@@ -507,6 +546,7 @@ async def anthropic_messages(request: Request) -> Response:
 
         current_block_index = -1
         current_block_type: str | None = None
+        last_block_type: str | None = None
         seen_thoughts: set[str] = set()
         active_tool_id: str | None = None
         active_tool_name: str | None = None
@@ -522,6 +562,7 @@ async def anthropic_messages(request: Request) -> Response:
             if current_block_type == "tool_use":
                 resolved_name, should_unwrap = _resolve_tool_name(active_tool_name or "tool", registered_tools)
                 args_obj = _normalize_tool_payload(resolved_name, active_tool_payload, should_unwrap)
+                print(f"[GATEWAY-TOOL] resolved={resolved_name}, active_name={active_tool_name}, args={args_obj}", flush=True)
                 queue.put_nowait(("content_block_delta", {
                     "type": "content_block_delta",
                     "index": current_block_index,
@@ -546,7 +587,7 @@ async def anthropic_messages(request: Request) -> Response:
                 current_block_type = None
 
         def on_event(ev):
-            nonlocal out_tokens, current_block_index, current_block_type
+            nonlocal out_tokens, current_block_index, current_block_type, last_block_type
             nonlocal active_tool_id, active_tool_name, active_tool_payload
             nonlocal has_tool_call, has_text_emitted
             nonlocal captured_conv_id, captured_msg_id
@@ -570,6 +611,7 @@ async def anthropic_messages(request: Request) -> Response:
                         close_current_block()
                         current_block_index += 1
                         current_block_type = "thinking"
+                        last_block_type = "thinking"
                         queue.put_nowait(("content_block_start", {
                             "type": "content_block_start",
                             "index": current_block_index,
@@ -583,17 +625,20 @@ async def anthropic_messages(request: Request) -> Response:
 
             elif ev.event_type == "tool_call_started":
                 call_id = ev.data.get("id") or ev.data.get("tool", "tool")
+                new_payload = ev.data.get("payload")
                 if current_block_type == "tool_use" and active_tool_id == call_id:
-                    active_tool_payload = ev.data.get("payload", active_tool_payload)
+                    if new_payload:
+                        active_tool_payload = new_payload
                 else:
                     close_current_block()
                     has_tool_call = True
                     current_block_index += 1
                     current_block_type = "tool_use"
+                    last_block_type = "tool_use"
                     active_tool_id = call_id
                     active_tool_name = ev.data.get("tool", "tool")
                     resolved_name, _ = _resolve_tool_name(active_tool_name, registered_tools)
-                    active_tool_payload = ev.data.get("payload", "{}")
+                    active_tool_payload = new_payload or "{}"
                     tool_use_id = f"toolu_{uuid.uuid4().hex[:20]}"
                     queue.put_nowait(("content_block_start", {
                         "type": "content_block_start",
@@ -608,6 +653,9 @@ async def anthropic_messages(request: Request) -> Response:
 
             elif ev.event_type == "tool_call_finished":
                 if current_block_type == "tool_use":
+                    new_payload = ev.data.get("payload")
+                    if new_payload:
+                        active_tool_payload = new_payload
                     close_current_block()
 
             elif ev.event_type == "delta":
@@ -619,6 +667,7 @@ async def anthropic_messages(request: Request) -> Response:
                         close_current_block()
                         current_block_index += 1
                         current_block_type = "text"
+                        last_block_type = "text"
                         queue.put_nowait(("content_block_start", {
                             "type": "content_block_start",
                             "index": current_block_index,
@@ -649,7 +698,7 @@ async def anthropic_messages(request: Request) -> Response:
                         "index": 0
                     }))
 
-                stop_reason = "tool_use" if (has_tool_call and not has_text_emitted) else "end_turn"
+                stop_reason = "tool_use" if last_block_type == "tool_use" else "end_turn"
                 queue.put_nowait(("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
