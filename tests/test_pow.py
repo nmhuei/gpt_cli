@@ -1,6 +1,23 @@
 import time
 import pytest
-from gpt_cli.transport.pow import solve_sentinel_pow, bootstrap_proof_token, PROOF_TOKEN_PREFIX, BOOTSTRAP_PROOF_PREFIX
+from gpt_cli.transport.pow import (
+    BOOTSTRAP_PROOF_PREFIX,
+    PROOF_TOKEN_PREFIX,
+    bootstrap_proof_token,
+    sentinel_fingerprint,
+    solve_sentinel_pow,
+)
+
+
+def test_sentinel_fingerprint_matches_verified_18_field_contract():
+    fingerprint = sentinel_fingerprint("ua", "device", 1_727_000_000.0)
+
+    assert len(fingerprint) == 18
+    assert fingerprint[0] == 4000
+    assert fingerprint[5] is None
+    assert fingerprint[8] == "en-US"
+    assert fingerprint[11:14] == ["location", "ontransitionend", 123.456]
+    assert "(" not in fingerprint[1]
 
 def test_solve_pow_known_vector():
     seed = "0.123456789"

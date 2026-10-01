@@ -267,6 +267,7 @@ class WireTransport:
                     and dag_state.role == "assistant"
                     and dag_state.recipient in (None, "", "all", "final")
                     and dag_state.content_type == "text"
+                    and dag_state.message_status in {"finished_successfully", "finished", "complete"}
                     and bool(dag_state.finish_type)
                     and bool(dag_state.node_id)
                 )

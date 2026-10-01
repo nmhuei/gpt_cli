@@ -23,6 +23,7 @@ class ConduitHandshake:
         conduit_token: str | None = None,
         use_prepare_header: bool = True,
         is_stream: bool = False,
+        target_path: str | None = "/backend-api/f/conversation",
     ) -> dict[str, str]:
         ua = user_agent or defaults.DEFAULT_USER_AGENT
         cookies = dict(bundle.cookies)
@@ -43,7 +44,7 @@ class ConduitHandshake:
             "oai-device-id": bundle.oai_device_id or "",
             "oai-session-id": turn_session_id,
             "x-oai-turn-trace-id": turn_trace_id,
-            "oai-client-version": "prod-e2ad78d66f0382704b60ec11f68f00408b5bea2a",
+            "oai-client-version": f"prod-{defaults.DEFAULT_BUILD_HASH}",
             "oai-client-build-number": "10145581",
             "oai-genui-client-actions": "open_entity_detail",
             "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
@@ -52,9 +53,10 @@ class ConduitHandshake:
             "sec-ch-ua-arch": '"x86"',
             "sec-ch-ua-bitness": '"64"',
             "sec-ch-ua-full-version": '"146.0.7680.177"',
-            "x-openai-target-path": "/backend-api/f/conversation",
-            "x-openai-target-route": "/backend-api/f/conversation",
         }
+        if target_path:
+            headers["x-openai-target-path"] = target_path
+            headers["x-openai-target-route"] = target_path
         if cookies:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
         if bundle.chatgpt_account_id:
@@ -94,7 +96,7 @@ class ConduitHandshake:
         # Step 1: Sentinel chat-requirements with bootstrap proof
         bootstrap = bootstrap_proof_token(ua, device_id)
         headers = ConduitHandshake.build_integrity_headers(
-            bundle, turn_session_id, turn_trace_id, ua
+            bundle, turn_session_id, turn_trace_id, ua, target_path=None
         )
         resp = await session.post(
             defaults.SENTINEL_PREPARE_URL,
@@ -102,7 +104,7 @@ class ConduitHandshake:
             json={"p": bootstrap},
             timeout=15.0
         )
-        is_prepare_stage = True
+        is_prepare_stage = False
         if resp.status_code != 200:
             resp = await session.post(
                 defaults.SENTINEL_CLASSIC_URL,
@@ -110,13 +112,10 @@ class ConduitHandshake:
                 json={"p": bootstrap},
                 timeout=15.0
             )
-            is_prepare_stage = False
             
         data = resp.json() if resp.status_code == 200 else {}
-        token = data.get("token")
-        if not token:
-            token = data.get("prepare_token") or data.get("prepareToken") or data.get("persona_token") or ""
-            is_prepare_stage = True
+        token = data.get("token") or ""
+        prepare_token = data.get("prepare_token") or data.get("prepareToken") or ""
 
         proof_token: str | None = None
         challenge = data.get("proofofwork") or data.get("proof_challenge")
@@ -129,11 +128,33 @@ class ConduitHandshake:
                 )
                 proof_token = PROOF_TOKEN_PREFIX + pow_val
 
+        # Step 1.5: Only a prepare-stage token needs finalization. A final
+        # requirements token must never be sent to this endpoint again.
+        if not token and prepare_token:
+            fin_resp = await session.post(
+                defaults.SENTINEL_FINALIZE_URL,
+                headers=headers,
+                json={"prepare_token": prepare_token},
+                timeout=15.0,
+            )
+            if fin_resp.status_code != 200:
+                raise RuntimeError(
+                    f"Sentinel finalize returned HTTP {fin_resp.status_code}"
+                )
+            fin_data = fin_resp.json()
+            token = fin_data.get("token") if isinstance(fin_data, dict) else None
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("Sentinel finalize returned no requirements token")
+
+        if not token:
+            raise RuntimeError("Sentinel requirements returned no usable token")
+
         # Step 2: Conduit Prepare
         conduit_headers = ConduitHandshake.build_integrity_headers(
             bundle, turn_session_id, turn_trace_id, ua,
             requirements_token=token, proof_token=proof_token,
-            use_prepare_header=is_prepare_stage
+            use_prepare_header=False,
+            target_path="/backend-api/f/conversation/prepare",
         )
         conduit_headers["X-Conduit-Token"] = "no-token"
 
@@ -181,8 +202,8 @@ class ConduitHandshake:
         final_headers = ConduitHandshake.build_integrity_headers(
             bundle, turn_session_id, turn_trace_id, ua,
             requirements_token=token, proof_token=proof_token,
-            conduit_token=conduit_token, use_prepare_header=is_prepare_stage,
-            is_stream=True
+            conduit_token=conduit_token, use_prepare_header=False,
+            is_stream=True, target_path="/backend-api/f/conversation",
         )
             
         return final_headers, turn_session_id, turn_trace_id, conduit_token

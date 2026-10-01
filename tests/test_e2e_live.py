@@ -10,8 +10,6 @@ TEST_PROMPTS = [
     "Viết 1 câu ngắn định nghĩa Định lý Pythagoras.",
     "Viết 1 câu ngắn định nghĩa Nguyên lý Archimedes.",
     "Viết 1 câu ngắn định nghĩa Định luật 1 Newton.",
-    "Viết 1 câu ngắn định nghĩa Thuyết tương đối hẹp.",
-    "Viết 1 câu ngắn định nghĩa Định luật bảo toàn năng lượng."
 ]
 
 @pytest.mark.live
@@ -19,13 +17,13 @@ TEST_PROMPTS = [
     os.getenv("WEBGPT_RUN_LIVE_TESTS") != "1",
     reason="live upstream certification requires WEBGPT_RUN_LIVE_TESTS=1",
 )
-def test_live_5_concurrent_workers_certification():
+def test_live_3_concurrent_workers_certification():
     async def _run():
         cache_mgr = TokenCacheManager("~/.local/share/webgpt/profiles/personal")
         bundle = cache_mgr.load_disk_cache()
         assert bundle is not None, "Personal token cache must exist for live certification"
 
-        pool = WorkerPool(max_workers=5)
+        pool = WorkerPool(max_workers=3)
         t0 = time.perf_counter()
 
         async def worker_job(worker_id: int, prompt: str):
@@ -42,7 +40,7 @@ def test_live_5_concurrent_workers_certification():
         results = await asyncio.gather(*tasks)
         total_time = time.perf_counter() - t0
 
-        assert len(results) == 5
+        assert len(results) == 3
         for i, res in enumerate(results):
             assert res.model == "gpt-5-6-thinking", f"Worker {i} did not use gpt-5-6-thinking"
             assert len(res.text.strip()) > 5, f"Worker {i} returned empty response"

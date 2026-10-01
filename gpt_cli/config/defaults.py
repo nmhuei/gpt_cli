@@ -39,15 +39,18 @@ DEFAULT_PID_FILE = user_data_dir() / "gateway.pid"
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = 18000
 DEFAULT_TIMEOUT_SECONDS = 300.0
-DEFAULT_MAX_WORKERS = 5
+DEFAULT_MAX_WORKERS = 3
 
 # Upstream Endpoints
 CHATGPT_BASE_URL = "https://chatgpt.com"
 SENTINEL_PREPARE_URL = "https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare"
+SENTINEL_FINALIZE_URL = "https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize"
 SENTINEL_CLASSIC_URL = "https://chatgpt.com/backend-api/sentinel/chat-requirements"
 FCONV_PREPARE_URL = "https://chatgpt.com/backend-api/f/conversation/prepare"
 FCONV_CONVERSATION_URL = "https://chatgpt.com/backend-api/f/conversation"
 FCONV_STEER_URL = "https://chatgpt.com/backend-api/f/steer_turn"
+
+DEFAULT_BUILD_HASH = "d92c92cf3397a05dfc98298acaae4f90b44e8386"
 
 # User-Agent matching impersonated Chrome/146 on Windows
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"

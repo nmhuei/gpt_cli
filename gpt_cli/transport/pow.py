@@ -6,12 +6,14 @@ import random
 import time
 from typing import Any
 
+from ..config import defaults
+
 BOOTSTRAP_PROOF_PREFIX = "gAAAAAC"
 PROOF_TOKEN_PREFIX = "gAAAAAB"
 _BOOTSTRAP_PROOF_TTL_SECONDS = 600.0
 SENTINEL_PROOF_MAX_ATTEMPTS = 500_000
 _BOOTSTRAP_DIFFICULTY = "0"
-_SENTINEL_BUILD_HASH = "prod-a696433ddfe0489db6696cae8c5778c2128f26e8"
+_SENTINEL_BUILD_HASH = f"prod-{defaults.DEFAULT_BUILD_HASH}"
 _WEBKIT_GUM_STRING = (
     "webkitGetUserMedia−"  # U+2212 MINUS SIGN is load-bearing
     "function webkitGetUserMedia() { [native code] }"
@@ -51,7 +53,7 @@ def sentinel_fingerprint(
     attempt: int = 0,
     elapsed_ms: float = 0.0,
 ) -> list[Any]:
-    """Build the fixed-order 18-element sentinel config array."""
+    """Build the verified fixed-order 18-element sentinel config array."""
     return [
         4000,
         sentinel_date_str(timestamp),
@@ -126,12 +128,9 @@ def bootstrap_proof_token(user_agent: str, device_id: str) -> str:
 
     seed = format(random.random(), ".6f")
     try:
-        answer = solve_sentinel_pow(
-            seed, _BOOTSTRAP_DIFFICULTY, user_agent, device_id
-        )
+        answer = solve_sentinel_pow(seed, _BOOTSTRAP_DIFFICULTY, user_agent, device_id)
     except SentinelPowExhausted:
         answer = bootstrap_pow_fallback(seed)
-
     proof = BOOTSTRAP_PROOF_PREFIX + answer
     _bootstrap_cache = (
         proof,

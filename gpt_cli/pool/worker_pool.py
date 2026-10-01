@@ -3,7 +3,7 @@ from typing import Any, Callable, Coroutine
 from ..config import defaults
 
 class WorkerPool:
-    """Smart async worker pool enforcing strict concurrency bounding (cap=5)."""
+    """Smart async worker pool enforcing strict concurrency bounding (default=3)."""
 
     def __init__(self, max_workers: int | None = None):
         self.max_workers = max_workers or defaults.DEFAULT_MAX_WORKERS

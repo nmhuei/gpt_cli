@@ -47,3 +47,11 @@ def test_runtime_directory_and_steer_endpoint_use_expected_paths(monkeypatch, tm
 
     assert defaults.user_runtime_dir() == tmp_path / "runtime/webgpt"
     assert defaults.FCONV_STEER_URL == "https://chatgpt.com/backend-api/f/steer_turn"
+
+
+def test_worker_default_is_three_and_environment_remains_configurable(monkeypatch):
+    monkeypatch.delenv("WEBGPT_MAX_WORKERS", raising=False)
+    assert Settings().max_workers == 3
+
+    monkeypatch.setenv("WEBGPT_MAX_WORKERS", "2")
+    assert Settings().max_workers == 2

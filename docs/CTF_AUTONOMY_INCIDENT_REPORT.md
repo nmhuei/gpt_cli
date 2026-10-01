@@ -163,6 +163,27 @@ completed result only when that exact descendant is a finished assistant text
 node. It does not suppress an error for an unrelated, incomplete, or still
 tool-running DAG.
 
+### INC-006 — speculative Sentinel and client-identity changes broke the wire contract
+
+**Observed:** The transport added duplicate case variants of
+`ChatGPT-Account-ID`, Codex-specific headers to ChatGPT Web requests, a
+25-field PoW fingerprint, and a finalize request even after Sentinel had
+already returned its final requirements token. The server could accept a
+conversation while emitting `unusual activity` over SSE.
+
+**Root cause:** these fields were changed without a matching browser capture.
+The verified f/conversation contract uses one account header, an 18-field PoW
+fingerprint, and distinct handling for `token` versus `prepare_token`.
+
+**Fix:** restore the verified header/fingerprint contract, finalize only a
+prepare-stage token, propagate a final token through the requirements-token
+header, and fail explicitly if finalization cannot mint a final token. The
+default worker count is three; the live certification also uses three workers.
+
+**Live verification:** a single fresh `gpt -p pong --json` turn completed with
+SSE lifecycle `completed_turn`, response text, conversation ID, and message
+ID, with no error.
+
 ## Operating invariants
 
 1. A new prompt starts a new conversation by default.  Resuming requires

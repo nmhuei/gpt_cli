@@ -89,6 +89,49 @@ def test_conversation_recovery_fetches_current_node_with_target_route():
 
     asyncio.run(_run())
 
+
+def test_conversation_recovery_rejects_a_later_user_turn_in_the_same_dag():
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        session = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "current_node": "assistant_later",
+            "mapping": {
+                "user_original": {
+                    "parent": "client-created-root",
+                    "message": {"author": {"role": "user"}, "content": {"content_type": "text"}},
+                },
+                "assistant_original": {
+                    "parent": "user_original",
+                    "message": {"author": {"role": "assistant"}, "content": {"content_type": "text"}},
+                },
+                "user_later": {
+                    "parent": "assistant_original",
+                    "message": {"author": {"role": "user"}, "content": {"content_type": "text"}},
+                },
+                "assistant_later": {
+                    "parent": "user_later",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["wrong reply"]},
+                        "status": "finished_successfully",
+                        "metadata": {"finish_details": {"type": "stop"}},
+                    },
+                },
+            },
+        }
+        session.get = AsyncMock(return_value=response)
+
+        state = await ConversationRecovery(bundle, session=session).fetch(
+            "conv_123", expected_user_message_id="user_original"
+        )
+
+        assert state.matches_expected_message is False
+
+    asyncio.run(_run())
+
 def test_wire_payload_construction():
     bundle = TokenBundle(access_token="fake", oai_device_id="dev")
     transport = WireTransport(bundle)

@@ -103,6 +103,10 @@ class ConversationRecovery:
                     break
                 visited.add(ancestor_id)
                 ancestor = mapping.get(ancestor_id) if isinstance(mapping, dict) else None
+                ancestor_message = ancestor.get("message") if isinstance(ancestor, dict) else None
+                ancestor_author = ancestor_message.get("author") if isinstance(ancestor_message, dict) else None
+                if isinstance(ancestor_author, dict) and ancestor_author.get("role") == "user":
+                    break
                 parent_id = ancestor.get("parent") if isinstance(ancestor, dict) else None
                 ancestor_id = parent_id if isinstance(parent_id, str) else None
         return ConversationState(
