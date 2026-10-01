@@ -30,6 +30,7 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+.worktrees/
 
 # Local state & logs
 live_telemetry.jsonl
