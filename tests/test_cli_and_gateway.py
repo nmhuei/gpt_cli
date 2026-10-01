@@ -51,6 +51,35 @@ def test_cli_parser_gateway_command():
     assert args.command == "start"
     assert args.port == 18000
 
+
+def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, tmp_path, capsys):
+    import asyncio
+    import json
+    from gpt_cli.cli.main import handle_run
+    from gpt_cli.core.types import TokenBundle, TurnResult
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+
+    async def fake_send_turn(self, *args, **kwargs):
+        return TurnResult(
+            text="I could not complete the task.",
+            conversation_id="conv_terminal",
+            message_id="msg_terminal",
+            model="gpt-5-6-thinking",
+            lifecycle_status="model_terminal",
+        )
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args(["run", "--json", "--new", "solve /tmp/challenge"])
+    asyncio.run(handle_run(args))
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["lifecycle_status"] == "model_terminal"
+    assert output["status"] == "terminal"
+
+
 def test_format_chat_messages_multi_turn():
     from gpt_cli.server.app import format_chat_messages
     messages = [
@@ -96,6 +125,21 @@ def test_format_chat_messages_with_tools_and_tool_results():
     assert "[User]\nmcp còn sống k" in formatted
     assert "[Assistant]\n[Tool Call: health_check input={\"verbose\": true}]" in formatted
     assert "[Tool Output]: {\"status\": \"ok\", \"uptime\": 16500}" in formatted
+
+def test_format_chat_messages_single_user_with_system_and_tools():
+    from gpt_cli.server.app import format_chat_messages
+    messages = [{"role": "user", "content": "Kiểm tra hệ thống"}]
+    tools = [{"name": "bash", "description": "Run shell", "input_schema": {"type": "object"}}]
+    formatted = format_chat_messages(
+        messages,
+        system_prompt="You are an autonomous CTF solver.",
+        tools=tools,
+    )
+    assert "[System Instruction]" in formatted
+    assert "You are an autonomous CTF solver." in formatted
+    assert "Available tools:" in formatted
+    assert "- bash: Run shell" in formatted
+    assert "[User]\nKiểm tra hệ thống" in formatted
 
 def test_anthropic_messages_streaming_blocks(monkeypatch):
     import json
@@ -326,11 +370,11 @@ def test_resolve_tool_name_mcp_namespacing():
     assert unwrap is False
 
     res, unwrap = _resolve_tool_name("functions.exec", registered)
-    assert res == "bash"
+    assert res == "functions.exec"
     assert unwrap is False
 
     res, unwrap = _resolve_tool_name("host_list_directory", registered)
-    assert res == "glob"
+    assert res == "host_list_directory"
     assert unwrap is False
 
 def test_normalize_tool_payload_bash_and_pruning():
@@ -356,5 +400,157 @@ def test_normalize_tool_payload_bash_and_pruning():
     assert norm_read["file_path"] == "/etc/hosts"
     assert "file" not in norm_read
 
+def test_gateway_compaction_isolation(monkeypatch, tmp_path):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.telemetry.events import TelemetryEvent
+    from gpt_cli.session.registry import SessionRegistry
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", str(tmp_path))
+
+    call_history = []
+    async def fake_send_turn(self, prompt, conversation_id=None, parent_id=None, *args, on_event=None, **kwargs):
+        call_history.append({"prompt": prompt, "conv_id": conversation_id, "parent_id": parent_id})
+        return TurnResult(text="Summary of history", conversation_id="conv_compaction", message_id="msg_compaction", model="gpt-5-6-thinking")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    app = create_app()
+    client = TestClient(app)
+
+    # Pre-create session
+    reg = SessionRegistry()
+    sess = reg.get_or_create(session_id="sess_compact_test")
+    reg.update_turn("sess_compact_test", conversation_id="conv_main", last_message_id="msg_main_node")
+
+    # Send request with metadata.purpose = compaction
+    res = client.post(
+        "/v1/messages",
+        headers={"x-deepseek-harness-session-id": "sess_compact_test"},
+        json={
+            "model": "gpt-5-6-thinking",
+            "metadata": {"purpose": "compaction"},
+            "messages": [
+                {"role": "user", "content": "Summarize this"}
+            ]
+        }
+    )
+    assert res.status_code == 200
+    # Wire call should NOT attach to main conversation
+    assert call_history[0]["conv_id"] is None
+    assert call_history[0]["parent_id"] is None
+
+    # Session in registry should still point to original main node!
+    refreshed = reg.get_session("sess_compact_test")
+    assert refreshed.last_message_id == "msg_main_node"
+    assert refreshed.conversation_id == "conv_main"
+
+def test_gateway_prefix_diffing_preserves_multiple_tool_results(monkeypatch, tmp_path):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.telemetry.events import TelemetryEvent
+    from gpt_cli.session.registry import SessionRegistry
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", str(tmp_path))
+
+    call_history = []
+    async def fake_send_turn(self, prompt, conversation_id=None, parent_id=None, *args, on_event=None, **kwargs):
+        call_history.append({"prompt": prompt, "conv_id": conversation_id, "parent_id": parent_id})
+        return TurnResult(text="Processed results", conversation_id="conv_multi", message_id="msg_multi_2", model="gpt-5-6-thinking")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    app = create_app()
+    client = TestClient(app)
+
+    reg = SessionRegistry()
+    reg.get_or_create(session_id="sess_multi_tool")
+    reg.update_turn("sess_multi_tool", conversation_id="conv_multi", last_message_id="msg_multi_1")
+
+    # Messages contain: user, assistant, then TWO tool_result blocks
+    messages = [
+        {"role": "user", "content": "Initial prompt"},
+        {"role": "assistant", "content": "Running two tools"},
+        {"role": "user", "content": [{"type": "tool_result", "content": "RESULT_FIRST", "tool_use_id": "call_1"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "RESULT_SECOND", "tool_use_id": "call_2"}]}
+    ]
+
+    res = client.post(
+        "/v1/messages",
+        headers={"x-deepseek-harness-session-id": "sess_multi_tool"},
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": messages
+        }
+    )
+    assert res.status_code == 200
+    sent_prompt = call_history[0]["prompt"]
+    # Prefix diffing MUST preserve BOTH RESULT_FIRST and RESULT_SECOND!
+    assert "RESULT_FIRST" in sent_prompt
+    assert "RESULT_SECOND" in sent_prompt
+    # And older turns before assistant should be trimmed
+    assert "Initial prompt" not in sent_prompt
+
+def test_anthropic_non_streaming_stop_reason_end_turn_when_text_produced(monkeypatch):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.telemetry.events import TelemetryEvent
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        if on_event:
+            on_event(TelemetryEvent(event_type="tool_call_started", data={"tool": "health_check", "payload": "{}"}))
+            on_event(TelemetryEvent(event_type="tool_call_finished", data={"output": "ok"}))
+            on_event(TelemetryEvent(event_type="delta", data={"text": "Everything is healthy."}))
+            on_event(TelemetryEvent(event_type="done", data={}))
+        return TurnResult(text="Everything is healthy.", conversation_id="conv_1", message_id="msg_1", model="gpt-5-6-thinking")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    app = create_app()
+    client = TestClient(app)
+
+    res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": [{"role": "user", "content": "status"}]
+        }
+    )
+    assert res.status_code == 200
+    data = res.json()
+    # When text is produced, stop_reason MUST be end_turn even if tools were captured upstream
+    assert data["stop_reason"] == "end_turn"
+    assert any(b.get("type") == "text" for b in data["content"])
+
+def test_cli_parser_newsession_command():
+    from gpt_cli.cli.main import build_cli_parser
+    parser = build_cli_parser()
+
+    # Test top-level newsession
+    args = parser.parse_args(["newsession", "-t", "test-tag", "Hello world"])
+    assert args.command == "newsession"
+    assert args.tag == "test-tag"
+    assert args.pos_prompt == ["Hello world"]
+
+    # Test top-level new
+    args2 = parser.parse_args(["new", "-t", "test-tag-2"])
+    assert args2.command == "new"
+    assert args2.tag == "test-tag-2"
+
+    # Test session new
+    args3 = parser.parse_args(["session", "new", "-t", "sub-tag"])
+    assert args3.command == "session"
+    assert args3.session_action == "new"
+    assert args3.tag == "sub-tag"
 
 

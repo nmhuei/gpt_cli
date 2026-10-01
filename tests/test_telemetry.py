@@ -174,6 +174,23 @@ def test_parse_tool_call_finished():
     assert tf_events[0].data["title"] == "Inspecting CTF Web Challenge"
     assert tf_events[0].data["resource"] == {"app_name": "brige"}
 
+
+def test_parse_tool_result_extracts_generic_exit_status():
+    parser = SSETelemetryParser()
+    frame = {
+        "message": {
+            "id": "tool_timeout_result",
+            "author": {"role": "tool"},
+            "content": {"content_type": "text", "parts": ["command exceeded its time limit\nexit: 124"]},
+            "metadata": {},
+        }
+    }
+
+    events = parser.feed(f"data: {json.dumps(frame)}\n\n".encode())
+
+    event = next(event for event in events if event.event_type == "tool_call_finished")
+    assert event.data["exit_code"] == 124
+
 def test_parse_citations():
     parser = SSETelemetryParser()
     frame = {
@@ -210,3 +227,165 @@ def test_recipient_all_final_assistant_message_emits_done():
     events = parser.feed(raw)
     done_events = [e for e in events if e.event_type == "done"]
     assert len(done_events) == 1
+
+def test_parse_crlf_boundary_split():
+    parser = SSETelemetryParser()
+    frame = {
+        "message": {
+            "id": "crlf_01",
+            "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": ["CRLF Hello"]},
+            "channel": "final"
+        }
+    }
+    raw = f"data: {json.dumps(frame)}\r\n\r\n".encode("utf-8")
+    cut = raw.index(b"\r") + 1
+    events = parser.feed(raw[:cut]) + parser.feed(raw[cut:])
+    deltas = [e.data.get("text") for e in events if e.event_type == "delta"]
+    assert "CRLF Hello" in "".join(deltas)
+
+def test_parse_thought_patch():
+    parser = SSETelemetryParser()
+    patch_frame = {
+        "p": "/message/content/thoughts",
+        "o": "patch",
+        "v": [{"summary": "Formulating algebraic reduction algorithm"}]
+    }
+    raw = f"data: {json.dumps(patch_frame)}\n\n".encode("utf-8")
+    events = parser.feed(raw)
+    th_events = [e for e in events if e.event_type == "thinking"]
+    assert len(th_events) == 1
+    assert th_events[0].data["thoughts"][0]["summary"] == "Formulating algebraic reduction algorithm"
+
+def test_tool_call_patch_does_not_leak_to_delta():
+    parser = SSETelemetryParser()
+    # 1. Tool start
+    start_frame = {
+        "message": {
+            "id": "t_01",
+            "author": {"role": "assistant"},
+            "recipient": "host_run_command",
+            "content": {"content_type": "text", "parts": []},
+            "status": "in_progress"
+        }
+    }
+    events = parser.feed(f"data: {json.dumps(start_frame)}\n\n".encode("utf-8"))
+    assert any(e.event_type == "tool_call_started" for e in events)
+
+    # 2. Tool argument append via patch
+    patch_frame = {
+        "p": "/message/content/parts/0",
+        "o": "append",
+        "v": '{"command": "uname -r"}'
+    }
+    events2 = parser.feed(f"data: {json.dumps(patch_frame)}\n\n".encode("utf-8"))
+    deltas = [e for e in events2 if e.event_type == "delta"]
+    assert len(deltas) == 0  # Must NOT leak as text delta!
+
+def test_thoughts_node_does_not_emit_message_id():
+    parser = SSETelemetryParser()
+    thoughts_frame = {
+        "message": {
+            "id": "thought_node_999",
+            "author": {"role": "assistant"},
+            "content": {"content_type": "thoughts", "thoughts": [{"summary": "Thinking"}]},
+            "status": "in_progress"
+        }
+    }
+    events = parser.feed(f"data: {json.dumps(thoughts_frame)}\n\n".encode("utf-8"))
+    msg_id_events = [e for e in events if e.event_type == "message_id"]
+    assert len(msg_id_events) == 0, "Thinking message ID must not be emitted to prevent DAG corruption"
+
+def test_formatter_renders_structured_payloads_without_tool_name_rules():
+    from gpt_cli.telemetry.formatter import format_tool_call, format_tool_output
+
+    title, details = format_tool_call("health_check", {"path": "/br/link_xyz/health_check"})
+    assert title == "🔧 [Tool Call: health_check]"
+    assert "/br/link_xyz/health_check" in details
+
+    hc_out = format_tool_output("health_check", {
+        "ok": True,
+        "service": "botquanganh-host-mcp",
+        "version": "1.0.0",
+        "metrics": {"uptime_seconds": 120}
+    })
+    assert "botquanganh-host-mcp" in hc_out
+    assert '"metrics"' in hc_out
+
+    bind_out = format_tool_output("host_workspace_bind", {
+        "ok": True,
+        "message": "Workspace ready at /tmp/test",
+        "chat_id": "cw-12345",
+        "workspace_dir": "/tmp/test",
+        "recent_commands": [{"cmd": "ls", "stdout": "abc"}] * 10
+    })
+    assert bind_out.startswith("```json")
+    assert "Workspace ready" in bind_out
+    assert "cw-12345" in bind_out
+    wl_out = format_tool_output("workspace_list", {
+        "ok": True,
+        "workspaces": [{"chat_id": "sess_1"}, {"chat_id": "sess_2"}, {"chat_id": "sess_3"}, {"chat_id": "sess_4"}],
+        "total_count": 4
+    })
+    assert wl_out.startswith("```json")
+    assert '"total_count": 4' in wl_out
+
+    big_raw = "A" * 1000
+    _, call_details = format_tool_call("custom_tool", {"raw": big_raw})
+    assert len(call_details) < 600
+    assert "truncated" in call_details
+
+    big_out = format_tool_output("custom_tool", big_raw)
+    assert len(big_out) < 600
+    assert "truncated" in big_out
+
+
+def test_parser_tracks_generic_parallel_tool_ids_without_name_allowlist():
+    parser = SSETelemetryParser()
+    start_a = {
+        "message": {
+            "id": "call-a",
+            "author": {"role": "assistant"},
+            "recipient": "vendor.dynamic_alpha",
+            "content": {"content_type": "text", "parts": ["{}"]},
+            "status": "in_progress",
+        }
+    }
+    start_b = {
+        "message": {
+            "id": "call-b",
+            "author": {"role": "assistant"},
+            "recipient": "vendor.dynamic_beta",
+            "content": {"content_type": "text", "parts": ["{}"]},
+            "status": "in_progress",
+        }
+    }
+    finish_b = {
+        "message": {
+            "id": "result-b",
+            "parent": "call-b",
+            "author": {"role": "tool"},
+            "content": {"content_type": "text", "parts": ["done"]},
+        }
+    }
+
+    events = []
+    for frame in (start_a, start_b, finish_b):
+        events.extend(parser.feed(f"data: {json.dumps(frame)}\n\n".encode()))
+
+    started = [event.data["id"] for event in events if event.event_type == "tool_call_started"]
+    finished = [event.data["id"] for event in events if event.event_type == "tool_call_finished"]
+    assert started == ["call-a", "call-b"]
+    assert finished == ["call-b"]
+
+
+def test_formatter_uses_payload_shape_not_ctf_or_workspace_tool_names():
+    from gpt_cli.telemetry.formatter import format_tool_call, format_tool_output
+
+    title, details = format_tool_call("vendor.workspace_bind", {"resume_id": "dynamic-1"})
+    assert title == "🔧 [Tool Call: vendor.workspace_bind]"
+    assert '"resume_id": "dynamic-1"' in details
+
+    rendered = format_tool_output("vendor.workspace_bind", {"ok": True, "chat_id": "dynamic-1"})
+    assert rendered.startswith("```json")
+    assert "Workspace" not in rendered

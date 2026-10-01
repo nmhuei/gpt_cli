@@ -1,15 +1,36 @@
+import os
 from pathlib import Path
 
+
+def user_data_dir() -> Path:
+    """Return the per-user data root while preserving the established state path."""
+    root = os.getenv("XDG_DATA_HOME") or os.getenv("LOCALAPPDATA")
+    if root:
+        return Path(root).expanduser() / "webgpt"
+    return Path.home() / ".local" / "share" / "webgpt"
+
+
+def user_config_dir() -> Path:
+    """Return the per-user config root using the platform's configured location."""
+    root = os.getenv("XDG_CONFIG_HOME") or os.getenv("APPDATA")
+    if root:
+        return Path(root).expanduser() / "gpt_cli"
+    return Path.home() / ".config" / "gpt_cli"
+
+
+def default_mcp_tunnel_file() -> Path:
+    return user_config_dir() / "mcp" / "tunnel_url.txt"
+
 # Paths
-DEFAULT_CACHE_DIR = Path.home() / ".local/share/webgpt/profiles/personal"
-DEFAULT_SESSION_DIR = Path.home() / ".local/share/webgpt/sessions"
-DEFAULT_LOG_DIR = Path.home() / ".local/share/webgpt/logs"
-DEFAULT_PID_FILE = Path.home() / ".local/share/webgpt/gateway.pid"
+DEFAULT_CACHE_DIR = user_data_dir() / "profiles" / "personal"
+DEFAULT_SESSION_DIR = user_data_dir() / "sessions"
+DEFAULT_LOG_DIR = user_data_dir() / "logs"
+DEFAULT_PID_FILE = user_data_dir() / "gateway.pid"
 
 # Network & Gateway
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = 18000
-DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_WORKERS = 5
 
 # Upstream Endpoints
@@ -27,7 +48,6 @@ DEFAULT_MODEL = "gpt-5-6-thinking"
 DEFAULT_EFFORT = "extended"
 
 # Bridge & MCP Settings
-DEFAULT_BRIDGE_NAME = "br"
-DEFAULT_MCP_PERMISSION = "full_access"
-DEFAULT_MCP_TUNNEL_FILE = Path("/home/light/GitHub/botquanganh_mcp/logs/tunnel_url.txt")
-
+DEFAULT_BRIDGE_NAME: str | None = None
+DEFAULT_MCP_PERMISSION = "read_only"
+DEFAULT_MCP_TUNNEL_FILE = default_mcp_tunnel_file()

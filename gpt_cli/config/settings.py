@@ -33,9 +33,9 @@ _loaded_env_path = load_dotenv_search()
 
 @dataclass(slots=True)
 class Settings:
-    cache_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_CACHE_DIR", str(defaults.DEFAULT_CACHE_DIR))))
-    session_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_SESSION_DIR", str(defaults.DEFAULT_SESSION_DIR))))
-    log_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_LOG_DIR", str(defaults.DEFAULT_LOG_DIR))))
+    cache_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_CACHE_DIR", str(defaults.user_data_dir() / "profiles" / "personal"))).expanduser())
+    session_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_SESSION_DIR", str(defaults.user_data_dir() / "sessions"))).expanduser())
+    log_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_LOG_DIR", str(defaults.user_data_dir() / "logs"))).expanduser())
     gateway_host: str = field(default_factory=lambda: os.getenv("WEBGPT_GATEWAY_HOST", defaults.DEFAULT_GATEWAY_HOST))
     gateway_port: int = field(default_factory=lambda: int(os.getenv("WEBGPT_GATEWAY_PORT", str(defaults.DEFAULT_GATEWAY_PORT))))
     max_workers: int = field(default_factory=lambda: int(os.getenv("WEBGPT_MAX_WORKERS", str(defaults.DEFAULT_MAX_WORKERS))))
@@ -47,11 +47,11 @@ class Settings:
     default_effort: str = field(default_factory=lambda: os.getenv("DEFAULT_EFFORT", defaults.DEFAULT_EFFORT))
 
     # Bridge & MCP defaults
-    default_bridge_name: str = field(default_factory=lambda: os.getenv("DEFAULT_BRIDGE_NAME", defaults.DEFAULT_BRIDGE_NAME))
+    default_bridge_name: str | None = field(default_factory=lambda: os.getenv("DEFAULT_BRIDGE_NAME") or defaults.DEFAULT_BRIDGE_NAME)
     default_mcp_permission: str = field(default_factory=lambda: os.getenv("DEFAULT_MCP_PERMISSION", defaults.DEFAULT_MCP_PERMISSION))
     default_mcp_url: str | None = field(default_factory=lambda: os.getenv("DEFAULT_MCP_URL"))
     default_mcp_tunnel_file: Path = field(
-        default_factory=lambda: Path(os.getenv("DEFAULT_MCP_TUNNEL_FILE", str(defaults.DEFAULT_MCP_TUNNEL_FILE)))
+        default_factory=lambda: Path(os.getenv("DEFAULT_MCP_TUNNEL_FILE", str(defaults.default_mcp_tunnel_file()))).expanduser()
     )
 
     def resolve_mcp_url(self, explicit_url: str | None = None) -> str:

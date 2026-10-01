@@ -14,15 +14,44 @@ def is_pid_alive(pid: int) -> bool:
     except OSError:
         return False
 
+def find_listening_pid() -> int | None:
+    """Finds PID of gateway if managed by systemd user service."""
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", "webgpt-gateway.service", "--property=MainPID"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if line.startswith("MainPID="):
+                    spid = int(line.split("=", 1)[1].strip())
+                    if spid > 0 and is_pid_alive(spid):
+                        return spid
+    except Exception:
+        pass
+    return None
+
 def read_pid() -> int | None:
     pid_file = defaults.DEFAULT_PID_FILE
-    if not pid_file.exists():
-        return None
-    try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip())
-        return pid if is_pid_alive(pid) else None
-    except Exception:
-        return None
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            if is_pid_alive(pid):
+                return pid
+        except Exception:
+            pass
+
+    spid = find_listening_pid()
+    if spid:
+        try:
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(spid), encoding="utf-8")
+        except Exception:
+            pass
+        return spid
+    return None
 
 def start_daemon(host: str = defaults.DEFAULT_GATEWAY_HOST, port: int = defaults.DEFAULT_GATEWAY_PORT) -> int:
     pid = read_pid()

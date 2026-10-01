@@ -27,3 +27,4 @@ class TurnResult:
     duration_ms: int = 0
     status: str = "completed"
     error: str | None = None
+    lifecycle_status: str | None = None

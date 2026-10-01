@@ -122,35 +122,19 @@ class WireTransport:
         last_msg_id = parent_id or ""
         resolved_model = model_def.slug
         is_done = False
+        completion_seen = False
+        pending_tool_ids: set[str] = set()
+        anonymous_tool_calls = 0
         stream_err: Exception | None = None
+        observed_events: list[Any] = []
 
         from ..telemetry.parser import SSETelemetryParser
         parser = SSETelemetryParser()
 
-        try:
-            async for chunk in response.aiter_content():
-                events = parser.feed(chunk)
-                for ev in events:
-                    if on_event:
-                        on_event(ev)
-                    if ev.event_type == "delta":
-                        text_chunk = ev.data.get("text", "")
-                        if text_chunk:
-                            full_text.append(text_chunk)
-                    elif ev.event_type == "conversation_id":
-                        captured_conv_id = ev.data.get("conversation_id")
-                    elif ev.event_type == "message_id":
-                        last_msg_id = ev.data.get("message_id")
-                    elif ev.event_type == "error":
-                        stream_err = RuntimeError(f"Upstream SSE error: {ev.data.get('error')}")
-                    elif ev.event_type == "done":
-                        is_done = True
-                if is_done:
-                    break
-        except Exception as exc:
-            stream_err = exc
-
-        for ev in parser.finish():
+        def consume_event(ev: Any) -> None:
+            """Update turn state from protocol identities, not a one-tool boolean."""
+            nonlocal captured_conv_id, last_msg_id, completion_seen, is_done, anonymous_tool_calls, stream_err
+            observed_events.append(ev)
             if on_event:
                 on_event(ev)
             if ev.event_type == "delta":
@@ -161,22 +145,85 @@ class WireTransport:
                 captured_conv_id = ev.data.get("conversation_id")
             elif ev.event_type == "message_id":
                 last_msg_id = ev.data.get("message_id")
+            elif ev.event_type == "tool_call_started":
+                tool_id = ev.data.get("id")
+                if isinstance(tool_id, str) and tool_id:
+                    pending_tool_ids.add(tool_id)
+                else:
+                    anonymous_tool_calls += 1
+            elif ev.event_type == "tool_call_finished":
+                tool_id = ev.data.get("id")
+                if isinstance(tool_id, str) and tool_id:
+                    pending_tool_ids.discard(tool_id)
+                elif anonymous_tool_calls:
+                    anonymous_tool_calls -= 1
+            elif ev.event_type == "error":
+                stream_err = RuntimeError(f"Upstream SSE error: {ev.data.get('error')}")
             elif ev.event_type == "done":
+                completion_seen = True
+            if completion_seen and not pending_tool_ids and not anonymous_tool_calls:
                 is_done = True
 
-        if stream_err and not full_text:
-            raise stream_err
+        try:
+            async for chunk in response.aiter_content():
+                events = parser.feed(chunk)
+                for ev in events:
+                    consume_event(ev)
+                if is_done:
+                    break
+        except Exception as exc:
+            stream_err = exc
+
+        for ev in parser.finish():
+            consume_event(ev)
+
+        lifecycle_status = None
+        if captured_conv_id and (stream_err is not None or not is_done):
+            from .conversation import ConversationRecovery
+            from .lifecycle import classify_lifecycle
+
+            recovery = ConversationRecovery(
+                self.bundle, session=self.session, user_agent=self.user_agent
+            )
+            try:
+                dag_state = await recovery.fetch(captured_conv_id)
+                lifecycle_status = classify_lifecycle(observed_events, dag_state).value
+            except Exception as recovery_error:
+                if stream_err is None:
+                    stream_err = recovery_error
+
+        if lifecycle_status is None:
+            from .lifecycle import classify_lifecycle
+            lifecycle_status = classify_lifecycle(observed_events, None).value
 
         t1 = time.perf_counter()
-        turn_status = "completed" if is_done else ("incomplete" if full_text else "failed")
+        if lifecycle_status == "completed_turn" and full_text:
+            turn_status = "completed"
+        elif lifecycle_status == "model_terminal":
+            turn_status = "terminal"
+        elif lifecycle_status in {
+            "connector_unavailable",
+            "server_active",
+            "tool_timeout",
+            "transport_lost",
+        }:
+            turn_status = "incomplete"
+        elif full_text:
+            turn_status = "incomplete"
+        else:
+            turn_status = "failed"
+
+        final_msg_id = last_msg_id if (full_text or last_msg_id) else (parent_id or "")
+
         return TurnResult(
             text="".join(full_text),
             conversation_id=captured_conv_id or "",
-            message_id=last_msg_id,
+            message_id=final_msg_id,
             model=resolved_model,
             duration_ms=int((t1 - t0) * 1000),
             status=turn_status,
-            error=str(stream_err) if stream_err else None
+            error=str(stream_err) if stream_err else None,
+            lifecycle_status=lifecycle_status,
         )
 
     async def send_turn(
@@ -187,10 +234,20 @@ class WireTransport:
         model_alias: str | None = None,
         effort: str | None = None,
         on_event: Callable[[Any], None] | None = None,
-        max_retries: int = 2,
+        max_retries: int = 5,
     ) -> TurnResult:
         last_err: Exception | None = None
         for attempt in range(max_retries):
+            tool_dispatched = False
+
+            def observe_event(event: Any) -> None:
+                """Forward telemetry while remembering whether replay became unsafe."""
+                nonlocal tool_dispatched
+                if event.event_type == "tool_call_started":
+                    tool_dispatched = True
+                if on_event:
+                    on_event(event)
+
             try:
                 res = await self._send_once(
                     prompt=prompt,
@@ -198,30 +255,65 @@ class WireTransport:
                     parent_id=parent_id,
                     model_alias=model_alias,
                     effort=effort,
-                    on_event=on_event,
+                    on_event=observe_event,
                 )
-                if res.status == "incomplete" and attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-                    continue
+                # If incomplete, stream has already delivered partial progress; do not auto-replay prompt
                 return res
             except Exception as e:
                 last_err = e
+                # A tool may already have mutated external state. Replaying the
+                # user prompt would duplicate that work and corrupt turn order.
+                if tool_dispatched:
+                    raise
                 err_msg = str(e)
-                if ("HTTP 401" in err_msg or "HTTP 403" in err_msg) and attempt == 0:
+                # Interruption 1: 401 Unauthorized / 403 Forbidden (Token expired / auth failure)
+                if any(x in err_msg for x in ("HTTP 401", "HTTP 403", "token_expired")):
+                    from ..core.token_cache import TokenCacheManager
+                    mgr = TokenCacheManager()
+                    # Only trigger browser lifebuoy if JWT is actually missing or expired (Rule 1)
+                    if not self.bundle.access_token or mgr.is_token_expired(self.bundle.access_token):
+                        try:
+                            from .lifebuoy import BrowserLifebuoy
+                            lifebuoy = BrowserLifebuoy(mgr)
+                            self.bundle = await lifebuoy.remint_credentials(headless=True)
+                            try:
+                                await self.session.close()
+                            except Exception:
+                                pass
+                            self.session = AsyncSession(impersonate="chrome146")
+                            await asyncio.sleep(1)
+                            continue
+                        except Exception:
+                            pass
+
+                # Interruption 2: 404 / 422 (DAG desync / missing node or conversation)
+                if conversation_id and any(x in err_msg for x in ("HTTP 404", "HTTP 422", "conversation_not_found", "parent_message_not_found")):
                     try:
-                        from .lifebuoy import BrowserLifebuoy
-                        from ..core.token_cache import TokenCacheManager
-                        lifebuoy = BrowserLifebuoy(TokenCacheManager())
-                        self.bundle = await lifebuoy.remint_credentials(headless=True)
-                        continue
+                        h = {"Authorization": f"Bearer {self.bundle.access_token}", "Accept": "application/json"}
+                        if self.bundle.chatgpt_account_id:
+                            h["ChatGPT-Account-ID"] = self.bundle.chatgpt_account_id
+                        r = await self.session.get(f"{defaults.CHATGPT_BASE_URL}/backend-api/conversation/{conversation_id}", headers=h)
+                        if r.status_code == 200:
+                            cdata = r.json()
+                            curr_node = cdata.get("current_node")
+                            if curr_node and curr_node != parent_id:
+                                parent_id = curr_node
+                                continue
                     except Exception:
                         pass
-                if ("HTTP 404" in err_msg or "HTTP 422" in err_msg or "conversation_not_found" in err_msg) and conversation_id and attempt == 0:
                     conversation_id = None
                     parent_id = None
                     continue
+
+                # Interruption 3: Network drop, connection reset, timeout, HTTP 500/502/503/504
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    try:
+                        await self.session.close()
+                    except Exception:
+                        pass
+                    self.session = AsyncSession(impersonate="chrome146")
+                    backoff = min(2 ** (attempt + 1), 20)
+                    await asyncio.sleep(backoff)
                 else:
                     raise last_err from None
         raise last_err or RuntimeError("send_turn failed after retries")

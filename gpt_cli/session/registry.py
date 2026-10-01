@@ -28,11 +28,14 @@ class SessionRegistry:
     @contextmanager
     def _lock(self):
         with self._rlock:
-            self.storage_dir.mkdir(parents=True, exist_ok=True)
             if self._lock_count == 0:
-                f = open(self.lock_file, "a+")
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                self._flock_fd = f
+                try:
+                    self.storage_dir.mkdir(parents=True, exist_ok=True)
+                    f = open(self.lock_file, "a+")
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    self._flock_fd = f
+                except OSError:
+                    self._flock_fd = None
             self._lock_count += 1
             try:
                 yield
@@ -62,25 +65,36 @@ class SessionRegistry:
             self._data = {"active_id": None, "sessions": {}}
 
     def _save(self) -> None:
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        tmp_file = self.storage_dir / f".tmp_{uuid.uuid4().hex}"
         try:
-            tmp_file.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-            os.replace(tmp_file, self.storage_file)
-        finally:
-            if tmp_file.exists():
-                try:
-                    tmp_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.storage_dir / f".tmp_{uuid.uuid4().hex}"
+            try:
+                tmp_file.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+                os.replace(tmp_file, self.storage_file)
+            finally:
+                if tmp_file.exists():
+                    try:
+                        tmp_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except OSError:
+            pass
 
     def get_active(self) -> SessionRecord | None:
         with self._lock():
             self._load()
             active_id = self._data.get("active_id")
-            if not active_id or active_id not in self._data["sessions"]:
-                return None
-            return SessionRecord(**self._data["sessions"][active_id])
+            if active_id and active_id in self._data["sessions"]:
+                return SessionRecord(**self._data["sessions"][active_id])
+            if self._data.get("sessions"):
+                latest_id = max(
+                    self._data["sessions"].keys(),
+                    key=lambda k: self._data["sessions"][k].get("updated_at", "")
+                )
+                self._data["active_id"] = latest_id
+                self._save()
+                return SessionRecord(**self._data["sessions"][latest_id])
+            return None
 
     def set_active(self, local_id: str) -> None:
         with self._lock():
@@ -97,7 +111,7 @@ class SessionRegistry:
                 return SessionRecord(**raw)
             return None
 
-    def create_session(self, local_id: str | None = None, tag: str | None = None) -> SessionRecord:
+    def create_session(self, local_id: str | None = None, tag: str | None = None, set_active: bool = True) -> SessionRecord:
         with self._lock():
             self._load()
             new_id = local_id or f"sess_{uuid.uuid4().hex[:8]}"
@@ -110,26 +124,38 @@ class SessionRegistry:
                 turns=0
             )
             self._data["sessions"][new_id] = asdict(rec)
-            self._data["active_id"] = new_id
+            if set_active:
+                self._data["active_id"] = new_id
             self._save()
             return rec
 
-    def get_or_create(self, session_id: str | None = None, tag: str | None = None) -> SessionRecord:
+    def get_or_create(self, session_id: str | None = None, tag: str | None = None, set_active: bool = True) -> SessionRecord:
         with self._lock():
             self._load()
             if session_id:
                 raw = self._data.get("sessions", {}).get(session_id)
                 if raw is not None:
-                    self._data["active_id"] = session_id
-                    self._save()
+                    if set_active:
+                        self._data["active_id"] = session_id
+                        self._save()
                     return SessionRecord(**raw)
-                return self.create_session(local_id=session_id, tag=tag)
+                return self.create_session(local_id=session_id, tag=tag, set_active=set_active)
 
             active_id = self._data.get("active_id")
             if active_id and active_id in self._data["sessions"]:
                 return SessionRecord(**self._data["sessions"][active_id])
 
-            return self.create_session(tag=tag)
+            if self._data.get("sessions"):
+                latest_id = max(
+                    self._data["sessions"].keys(),
+                    key=lambda k: self._data["sessions"][k].get("updated_at", "")
+                )
+                if set_active:
+                    self._data["active_id"] = latest_id
+                    self._save()
+                return SessionRecord(**self._data["sessions"][latest_id])
+
+            return self.create_session(tag=tag, set_active=set_active)
 
     def update_turn(
         self,
@@ -152,6 +178,29 @@ class SessionRegistry:
                 return SessionRecord(**s)
             return None
 
+    def checkpoint(
+        self,
+        local_id: str,
+        conversation_id: str | None,
+        message_id: str | None,
+        model: str | None = None,
+    ) -> SessionRecord | None:
+        """Persist an observed upstream pointer without counting a finished turn."""
+        with self._lock():
+            self._load()
+            session = self._data.get("sessions", {}).get(local_id)
+            if session is None:
+                return None
+            if conversation_id:
+                session["conversation_id"] = conversation_id
+            if message_id:
+                session["last_message_id"] = message_id
+            if model:
+                session["model"] = model
+            session["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save()
+            return SessionRecord(**session)
+
     def list_sessions(self) -> list[SessionRecord]:
         with self._lock():
             self._load()
@@ -170,8 +219,14 @@ class SessionRegistry:
             if local_id in self._data.get("sessions", {}):
                 del self._data["sessions"][local_id]
                 if self._data.get("active_id") == local_id:
-                    remaining = list(self._data["sessions"].keys())
-                    self._data["active_id"] = remaining[0] if remaining else None
+                    if self._data["sessions"]:
+                        latest_id = max(
+                            self._data["sessions"].keys(),
+                            key=lambda k: self._data["sessions"][k].get("updated_at", "")
+                        )
+                        self._data["active_id"] = latest_id
+                    else:
+                        self._data["active_id"] = None
                 self._save()
                 return True
             return False

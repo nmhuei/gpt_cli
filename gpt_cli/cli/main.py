@@ -14,19 +14,21 @@ from ..session.registry import SessionRegistry
 from ..session.logger import SessionLogManager
 from ..transport.wire import WireTransport
 from ..server.daemon import start_daemon, stop_daemon, status_daemon
+from ..telemetry.formatter import format_tool_call, format_tool_output
 
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gpt",
         description="WebGPT Remake - High-performance Wire Runtime & Gateway"
     )
-    subparsers = parser.add_subparsers(dest="command", required=False)
+    subparsers = parser.add_subparsers(dest="command", required=False, metavar="<command>")
 
     settings = Settings()
 
     # 1. run
     run_p = subparsers.add_parser("run", help="Run a turn with the model")
-    run_p.add_argument("-p", "--prompt", required=True, help="Prompt text")
+    run_p.add_argument("-p", "--prompt", default=None, help="Prompt text (optional if provided as positional arguments)")
+    run_p.add_argument("pos_prompt", nargs="*", default=[], help="Positional prompt text")
     run_p.add_argument("-s", "--session", default=None, help="Local session ID to continue")
     run_p.add_argument("-n", "--new", action="store_true", help="Start a new session")
     run_p.add_argument("-t", "--tag", default=None, help="Tag for the session")
@@ -35,7 +37,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
     run_p.add_argument("-b", "--bridge", default=None, help=f"Active MCP bridge/connector name (default: {settings.default_bridge_name})")
     run_p.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
     run_p.add_argument("--conv", default=None, help="Continue an existing ChatGPT Web conversation UUID")
-    run_p.add_argument("--max-turns", type=int, default=1, help="Max autonomous turns to execute (default: 1)")
     run_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
     # 2. chat (interactive)
@@ -71,11 +72,26 @@ def build_cli_parser() -> argparse.ArgumentParser:
     set_p = sess_sub.add_parser("set", help="Set active session")
     set_p.add_argument("session_id", help="Local session ID")
 
+    # session new
+    new_sess_p = sess_sub.add_parser("new", help="Create a fresh session and set as active")
+    new_sess_p.add_argument("-t", "--tag", default=None, help="Tag for the new session")
+
     # session delete
     del_p = sess_sub.add_parser("delete", help="Delete a session")
     del_p.add_argument("session_id", help="Local session ID")
 
-    # 4. Gateway control
+    # 4. newsession / new (explicit fresh session)
+    for cmd in ("newsession", "new"):
+        np = subparsers.add_parser(cmd, help="Start a fresh session and set as active (optionally run initial prompt)")
+        np.add_argument("-t", "--tag", default=None, help="Tag for the session")
+        np.add_argument("-m", "--model", default=settings.default_model, help="Model alias")
+        np.add_argument("-e", "--effort", default=settings.default_effort, help="Thinking effort")
+        np.add_argument("-b", "--bridge", default=None, help="Active MCP bridge")
+        np.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
+        np.add_argument("--json", action="store_true", help="Output JSON")
+        np.add_argument("pos_prompt", nargs="*", default=[], help="Optional initial prompt to run")
+
+    # 5. Gateway control
     start_p = subparsers.add_parser("start", help="Start gateway daemon")
     start_p.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
     start_p.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
@@ -87,65 +103,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
 
     status_p = subparsers.add_parser("status", help="Check gateway daemon status")
     status_p.add_argument("--json", action="store_true", help="Output JSON")
-
-    # 5. plugin / mcp management
-    for cmd_name in ("plugin", "mcp"):
-        plug_p = subparsers.add_parser(cmd_name, help=f"Manage ChatGPT Web plugins & MCP connectors ({cmd_name})")
-        plug_sub = plug_p.add_subparsers(dest="plugin_action", required=True)
-
-        # list
-        p_list = plug_sub.add_parser("list", help="List custom MCP plugins/connectors")
-        p_list.add_argument("--all", action="store_true", help="Include built-in system connectors")
-        p_list.add_argument("--json", action="store_true", help="Output JSON")
-
-        # add
-        p_add = plug_sub.add_parser("add", help="Add a new MCP plugin with auto full_access permissions")
-        p_add.add_argument("name", nargs="?", default=None, help=f"Plugin / Connector name (default: {settings.default_bridge_name})")
-        p_add.add_argument("url", nargs="?", default=None, help="Public MCP server endpoint URL (default: auto from tunnel_url.txt)")
-        p_add.add_argument("--desc", default="", help="Description")
-        p_add.add_argument("--permission", default=settings.default_mcp_permission, choices=["full_access", "low_risk", "read_only", "always_ask"], help="Permission level (default: full_access = Allow all tools / ELEVATED RISK)")
-        p_add.add_argument("--json", action="store_true", help="Output JSON")
-
-        # delete / rm
-        p_del = plug_sub.add_parser("delete", help="Delete an MCP plugin by name or ID")
-        p_del.add_argument("identifier", help="Plugin name, Link ID, or Connector ID")
-        p_del.add_argument("--json", action="store_true", help="Output JSON")
-
-        p_rm = plug_sub.add_parser("rm", help="Delete an MCP plugin by name or ID (alias for delete)")
-        p_rm.add_argument("identifier", help="Plugin name, Link ID, or Connector ID")
-        p_rm.add_argument("--json", action="store_true", help="Output JSON")
-
-        # permission
-        p_perm = plug_sub.add_parser("permission", help="Configure permission level for a plugin")
-        p_perm.add_argument("identifier", help="Plugin name, Link ID, or Connector ID")
-        p_perm.add_argument("level", nargs="?", default="full_access", choices=["full_access", "low_risk", "read_only", "always_ask"], help="Permission level (default: full_access)")
-        p_perm.add_argument("--json", action="store_true", help="Output JSON")
-
-        # sync
-        p_sync = plug_sub.add_parser("sync", help="Synchronize MCP plugin URL with latest tunnel URL")
-        p_sync.add_argument("name", nargs="?", default=None, help="Plugin name to sync (default: configured default bridge)")
-        p_sync.add_argument("--json", action="store_true", help="Output JSON")
-
-    # 6. web (ChatGPT Web conversations)
-    web_p = subparsers.add_parser("web", help="Interact with ChatGPT Web conversations")
-    web_sub = web_p.add_subparsers(dest="web_action", required=True)
-    web_list_p = web_sub.add_parser("list", help="List recent conversations from ChatGPT Web")
-    web_list_p.add_argument("--limit", type=int, default=15, help="Number of conversations to display (default: 15)")
-    web_list_p.add_argument("--json", action="store_true", help="Output JSON")
-
     return parser
 
-def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> str:
-    """Prepend active bridge mention (e.g. '@brige ') if not already present."""
-    p = prompt.strip()
-    if not bridge_name or str(bridge_name).lower() in ("off", "none", "false"):
-        return p
-    clean_bridge = str(bridge_name).lstrip("@").strip()
-    if not clean_bridge:
-        return p
-    if p.startswith(f"@{clean_bridge} ") or p == f"@{clean_bridge}":
-        return p
-    return f"@{clean_bridge} {p}"
+from ..core.bridge import resolve_prompt_with_bridge
+
 
 async def interactive_chat(
     model: str = "gpt-5-6-thinking",
@@ -272,10 +233,10 @@ async def interactive_chat(
                         printed_telemetry.add(call_id)
                     tool_name = ev.data.get("tool", "tool")
                     payload = ev.data.get("payload")
-                    payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, (dict, list)) else str(payload or "")
-                    sys.stdout.write(f"\n\033[36m🔧 [Tool Call: {tool_name}]\033[0m\n")
-                    if payload_str:
-                        sys.stdout.write(f"\033[2m📥 Input: {payload_str}\033[0m\n")
+                    title, details = format_tool_call(tool_name, payload)
+                    sys.stdout.write(f"\n\033[36m{title}\033[0m\n")
+                    if details:
+                        sys.stdout.write(f"\033[2m{details}\033[0m\n")
                     sys.stdout.flush()
             elif ev.event_type == "tool_call_finished":
                 call_id = ev.data.get("id")
@@ -283,12 +244,14 @@ async def interactive_chat(
                 if not fin_key or fin_key not in printed_telemetry:
                     if fin_key:
                         printed_telemetry.add(fin_key)
+                    tool_name = ev.data.get("tool", "")
                     title = ev.data.get("title") or ""
                     output = ev.data.get("output") or ""
-                    out_str = str(output)[:2000] if output else ""
-                    if len(str(output)) > 2000:
-                        out_str += f"\n... [truncated {len(str(output)) - 2000} bytes]"
-                    sys.stdout.write(f"\033[36m📤 [Tool Output{f': {title}' if title else ''}]\033[0m\n")
+                    fmt_out = format_tool_output(tool_name, output, title=title)
+                    out_str = fmt_out[:2000] if fmt_out else ""
+                    if len(fmt_out) > 2000:
+                        out_str += f"\n... [truncated {len(fmt_out) - 2000} bytes]"
+                    sys.stdout.write(f"\033[36m📤 [Tool Result]\033[0m\n")
                     if out_str:
                         sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
                     sys.stdout.flush()
@@ -356,6 +319,7 @@ async def handle_run(args: argparse.Namespace) -> None:
     log_mgr = SessionLogManager()
     settings = Settings()
 
+    sess: SessionRecord | None = None
     if getattr(args, "conv", None):
         conv_id = args.conv
         try:
@@ -377,209 +341,233 @@ async def handle_run(args: argparse.Namespace) -> None:
         except Exception as e:
             if not getattr(args, "json", False):
                 print(f"Warning: Failed to attach web conversation: {e}\n", file=sys.stderr)
-    elif getattr(args, "new", False):
-        sess = reg.create_session(tag=getattr(args, "tag", None))
-    elif getattr(args, "session", None):
-        sess = reg.get_or_create(session_id=args.session, tag=getattr(args, "tag", None))
-    else:
-        sess = reg.get_or_create(tag=getattr(args, "tag", None))
+
+    if not sess:
+        if getattr(args, "new", False):
+            sess = reg.create_session(tag=getattr(args, "tag", None))
+        elif getattr(args, "session", None):
+            sess = reg.get_or_create(session_id=args.session, tag=getattr(args, "tag", None))
+        else:
+            sess = reg.get_or_create(tag=getattr(args, "tag", None))
+
+    # Resolve prompt from either -p/--prompt, positional arguments, or stdin
+    raw_prompt = getattr(args, "prompt", None)
+    pos_parts = getattr(args, "pos_prompt", [])
+    if not raw_prompt and pos_parts:
+        raw_prompt = " ".join(pos_parts).strip()
+    if not raw_prompt and not sys.stdin.isatty():
+        raw_prompt = sys.stdin.read().strip()
+    if not raw_prompt:
+        if getattr(args, "json", False):
+            print(json.dumps({"status": "error", "message": "Prompt is required"}))
+        else:
+            print("Error: Prompt is required. Example: `gpt \"Hello\"` or `gpt run \"Your task\"`", file=sys.stderr)
+        sys.exit(2)
 
     active_bridge: str | None = None if getattr(args, "no_bridge", False) else (getattr(args, "bridge", None) or settings.default_bridge_name)
-    max_turns = max(1, getattr(args, "max_turns", 1))
-    current_prompt = args.prompt
-    last_result = None
 
-    async with WireTransport(bundle) as transport:
-        for turn_idx in range(max_turns):
-            turn_number = sess.turns + 1
-            captured_thoughts: list[str] = []
-            captured_tools: list[dict[str, Any]] = []
-            printed_telemetry: set[str] = set()
+    turn_number = sess.turns + 1
+    captured_thoughts: list[str] = []
+    captured_tools: list[dict[str, Any]] = []
+    printed_telemetry: set[str] = set()
+    checkpoint_conversation_id = sess.conversation_id
+    checkpoint_message_id = sess.last_message_id
 
-            def on_event(ev):
-                log_mgr.log_event(sess.local_id, ev, turn_index=turn_number)
-                if getattr(args, "json", False):
-                    return
-                if ev.event_type == "delta":
-                    delta_text = ev.data.get("text", "")
-                    sys.stdout.write(delta_text)
+    def on_event(ev):
+        nonlocal checkpoint_conversation_id, checkpoint_message_id
+        log_mgr.log_event(sess.local_id, ev, turn_index=turn_number)
+        is_json = getattr(args, "json", False)
+
+        if ev.event_type == "conversation_id":
+            checkpoint_conversation_id = ev.data.get("conversation_id") or checkpoint_conversation_id
+        elif ev.event_type == "message_id":
+            checkpoint_message_id = ev.data.get("message_id") or checkpoint_message_id
+        if ev.event_type in {"conversation_id", "message_id"}:
+            reg.checkpoint(
+                sess.local_id,
+                checkpoint_conversation_id,
+                checkpoint_message_id,
+                getattr(args, "model", None),
+            )
+
+        if ev.event_type == "delta":
+            delta_text = ev.data.get("text", "")
+            if not is_json:
+                sys.stdout.write(delta_text)
+                sys.stdout.flush()
+        elif ev.event_type == "thinking":
+            title = ev.data.get("title")
+            if title and title not in printed_telemetry:
+                printed_telemetry.add(title)
+                if not is_json:
+                    sys.stdout.write(f"\033[2m💭 [Thinking] {title}\033[0m\n")
                     sys.stdout.flush()
-                elif ev.event_type == "thinking":
-                    title = ev.data.get("title")
-                    if title and title not in printed_telemetry:
-                        printed_telemetry.add(title)
-                        sys.stdout.write(f"\033[2m💭 [Thinking] {title}\033[0m\n")
+            for th in ev.data.get("thoughts", []):
+                summ = th.get("summary") if isinstance(th, dict) else str(th)
+                if summ and summ not in printed_telemetry:
+                    printed_telemetry.add(summ)
+                    captured_thoughts.append(summ)
+                    if not is_json:
+                        sys.stdout.write(f"\033[2m💭 [Thinking] {summ}\033[0m\n")
                         sys.stdout.flush()
-                    for th in ev.data.get("thoughts", []):
-                        summ = th.get("summary") if isinstance(th, dict) else str(th)
-                        if summ and summ not in printed_telemetry:
-                            printed_telemetry.add(summ)
-                            captured_thoughts.append(summ)
-                            sys.stdout.write(f"\033[2m💭 [Thinking] {summ}\033[0m\n")
-                            sys.stdout.flush()
-                elif ev.event_type == "reasoning_recap":
-                    recap_str = ev.data.get("recap")
-                    if recap_str and recap_str not in printed_telemetry:
-                        printed_telemetry.add(recap_str)
-                        sys.stdout.write(f"\033[2m⏱️ [{recap_str}]\033[0m\n")
-                        sys.stdout.flush()
-                elif ev.event_type == "tool_call_started":
-                    captured_tools.append(ev.data)
-                    call_id = ev.data.get("id")
-                    if not call_id or call_id not in printed_telemetry:
-                        if call_id:
-                            printed_telemetry.add(call_id)
-                        tool_name = ev.data.get("tool", "tool")
-                        payload = ev.data.get("payload")
-                        payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, (dict, list)) else str(payload or "")
-                        sys.stdout.write(f"\n\033[36m🔧 [Tool Call: {tool_name}]\033[0m\n")
-                        if payload_str:
-                            sys.stdout.write(f"\033[2m📥 Input: {payload_str}\033[0m\n")
-                        sys.stdout.flush()
-                elif ev.event_type == "tool_call_finished":
-                    call_id = ev.data.get("id")
-                    fin_key = f"fin_{call_id}" if call_id else None
-                    if not fin_key or fin_key not in printed_telemetry:
-                        if fin_key:
-                            printed_telemetry.add(fin_key)
-                        title = ev.data.get("title") or ""
-                        output = ev.data.get("output") or ""
-                        out_str = str(output)[:2000] if output else ""
-                        if len(str(output)) > 2000:
-                            out_str += f"\n... [truncated {len(str(output)) - 2000} bytes]"
-                        sys.stdout.write(f"\033[36m📤 [Tool Output{f': {title}' if title else ''}]\033[0m\n")
-                        if out_str:
-                            sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
-                        sys.stdout.flush()
-                elif ev.event_type == "web_search":
-                    queries = ev.data.get("queries", [])
-                    q_str = ", ".join(queries) if queries else ""
-                    if q_str and q_str not in printed_telemetry:
-                        printed_telemetry.add(q_str)
-                        sys.stdout.write(f"\033[34m🌐 [Search] {q_str}...\033[0m\n")
-                        sys.stdout.flush()
-                elif ev.event_type == "citations":
-                    cites = ev.data.get("citations", [])
-                    if cites:
-                        c_lines = "\n".join(f"  [{i+1}] {c.get('title', 'Source')}: {c.get('url')}" for i, c in enumerate(cites))
-                        sys.stdout.write(f"\n\033[33m📚 Sources:\n{c_lines}\033[0m\n")
-                        sys.stdout.flush()
+        elif ev.event_type == "reasoning_recap":
+            recap_str = ev.data.get("recap")
+            if recap_str and recap_str not in printed_telemetry:
+                printed_telemetry.add(recap_str)
+                if not is_json:
+                    sys.stdout.write(f"\033[2m⏱️ [{recap_str}]\033[0m\n")
+                    sys.stdout.flush()
+        elif ev.event_type == "tool_call_started":
+            captured_tools.append(ev.data)
+            call_id = ev.data.get("id")
+            if not call_id or call_id not in printed_telemetry:
+                if call_id:
+                    printed_telemetry.add(call_id)
+                tool_name = ev.data.get("tool", "tool")
+                payload = ev.data.get("payload")
+                if not is_json:
+                    title, details = format_tool_call(tool_name, payload)
+                    sys.stdout.write(f"\n\033[36m{title}\033[0m\n")
+                    if details:
+                        sys.stdout.write(f"\033[2m{details}\033[0m\n")
+                    sys.stdout.flush()
+        elif ev.event_type == "tool_call_finished":
+            call_id = ev.data.get("id")
+            fin_key = f"fin_{call_id}" if call_id else None
+            if not fin_key or fin_key not in printed_telemetry:
+                if fin_key:
+                    printed_telemetry.add(fin_key)
+                tool_name = ev.data.get("tool", "")
+                title = ev.data.get("title") or ""
+                output = ev.data.get("output") or ""
+                if not is_json:
+                    fmt_out = format_tool_output(tool_name, output, title=title)
+                    out_str = fmt_out[:2000] if fmt_out else ""
+                    if len(fmt_out) > 2000:
+                        out_str += f"\n... [truncated {len(fmt_out) - 2000} bytes]"
+                    sys.stdout.write(f"\033[36m📤 [Tool Result]\033[0m\n")
+                    if out_str:
+                        sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
+                    sys.stdout.flush()
+        elif ev.event_type == "web_search":
+            queries = ev.data.get("queries", [])
+            q_str = ", ".join(queries) if queries else ""
+            if q_str and q_str not in printed_telemetry:
+                printed_telemetry.add(q_str)
+                if not is_json:
+                    sys.stdout.write(f"\033[34m🌐 [Search] {q_str}...\033[0m\n")
+                    sys.stdout.flush()
+        elif ev.event_type == "citations":
+            cites = ev.data.get("citations", [])
+            if cites and not is_json:
+                c_lines = "\n".join(f"  [{i+1}] {c.get('title', 'Source')}: {c.get('url')}" for i, c in enumerate(cites))
+                sys.stdout.write(f"\n\033[33m📚 Sources:\n{c_lines}\033[0m\n")
+                sys.stdout.flush()
 
-            wire_prompt = resolve_prompt_with_bridge(current_prompt, active_bridge)
+    wire_prompt = resolve_prompt_with_bridge(raw_prompt, active_bridge)
 
-            last_event_time = time.monotonic()
-            def on_event_with_timer(ev):
-                nonlocal last_event_time
-                last_event_time = time.monotonic()
-                on_event(ev)
+    last_event_time = time.monotonic()
+    def on_event_with_timer(ev):
+        nonlocal last_event_time
+        last_event_time = time.monotonic()
+        on_event(ev)
 
-            async def heartbeat_pinger():
-                while True:
-                    await asyncio.sleep(20)
-                    if time.monotonic() - last_event_time >= 20:
-                        if not getattr(args, "json", False):
-                            sys.stdout.write("\033[2m⏱️ [Conduit Heartbeat] Model/tool operation in progress...\033[0m\n")
-                            sys.stdout.flush()
+    async def heartbeat_pinger():
+        while True:
+            await asyncio.sleep(20)
+            if time.monotonic() - last_event_time >= 20:
+                if not getattr(args, "json", False):
+                    sys.stdout.write("\033[2m⏱️ [Conduit Heartbeat] Model/tool operation in progress...\033[0m\n")
+                    sys.stdout.flush()
 
-            pinger_task = asyncio.create_task(heartbeat_pinger())
-            err_str = None
-            try:
-                result = await transport.send_turn(
-                    prompt=wire_prompt,
-                    conversation_id=sess.conversation_id,
-                    parent_id=sess.last_message_id,
-                    model_alias=getattr(args, "model", "gpt-5-6-thinking"),
-                    effort=getattr(args, "effort", "extended"),
-                    on_event=on_event_with_timer
-                )
-            except Exception as e:
-                err_str = str(e)
-                log_mgr.log_turn(
-                    local_id=sess.local_id,
-                    turn_index=turn_number,
-                    prompt=current_prompt,
-                    response="",
-                    model=getattr(args, "model", "gpt-5-6-thinking"),
-                    duration_ms=0,
-                    conversation_id=sess.conversation_id,
-                    message_id=sess.last_message_id,
-                    error=err_str
-                )
-                raise
-            finally:
-                pinger_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await pinger_task
-
-            log_mgr.log_turn(
-                local_id=sess.local_id,
-                turn_index=turn_number,
-                prompt=current_prompt,
-                response=result.text,
-                model=result.model,
-                duration_ms=result.duration_ms,
-                conversation_id=result.conversation_id,
-                message_id=result.message_id,
-                thinking=captured_thoughts,
-                tool_calls=captured_tools
+    pinger_task = asyncio.create_task(heartbeat_pinger())
+    err_str = None
+    try:
+        async with WireTransport(bundle) as transport:
+            result = await transport.send_turn(
+                prompt=wire_prompt,
+                conversation_id=sess.conversation_id,
+                parent_id=sess.last_message_id,
+                model_alias=getattr(args, "model", "gpt-5-6-thinking"),
+                effort=getattr(args, "effort", "extended"),
+                on_event=on_event_with_timer
             )
+    except KeyboardInterrupt:
+        if not getattr(args, "json", False):
+            sys.stdout.write(f"\n\n\033[1;33m⏸️ [Interrupted by User] Session saved: {sess.local_id}\033[0m\n")
+            sys.stdout.write(f"\033[2mTo resume at any time, run:\n  gpt run -s {sess.local_id}\033[0m\n\n")
+            sys.stdout.flush()
+        sys.exit(130)
+    except Exception as e:
+        err_str = str(e)
+        log_mgr.log_turn(
+            local_id=sess.local_id,
+            turn_index=turn_number,
+            prompt=raw_prompt,
+            response="",
+            model=getattr(args, "model", "gpt-5-6-thinking"),
+            duration_ms=0,
+            conversation_id=sess.conversation_id,
+            message_id=sess.last_message_id,
+            error=err_str
+        )
+        raise
+    finally:
+        pinger_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pinger_task
 
-            updated_sess = reg.update_turn(
-                local_id=sess.local_id,
-                conversation_id=result.conversation_id,
-                last_message_id=result.message_id,
-                model=result.model
-            )
-            sess = updated_sess or reg.get_session(sess.local_id) or sess
-            last_result = result
+    log_mgr.log_turn(
+        local_id=sess.local_id,
+        turn_index=turn_number,
+        prompt=raw_prompt,
+        response=result.text,
+        model=result.model,
+        duration_ms=result.duration_ms,
+        conversation_id=result.conversation_id,
+        message_id=result.message_id,
+        thinking=captured_thoughts,
+        tool_calls=captured_tools
+    )
 
-            flag_file = Path("flag.txt")
-            if flag_file.is_file() and flag_file.read_text(encoding="utf-8").strip():
-                break
+    effective_msg_id = result.message_id or checkpoint_message_id or sess.last_message_id
+    effective_conversation_id = result.conversation_id or checkpoint_conversation_id or sess.conversation_id or ""
+    reg.update_turn(
+        local_id=sess.local_id,
+        conversation_id=effective_conversation_id,
+        last_message_id=effective_msg_id,
+        model=result.model
+    )
 
-            import re
-            flag_match = re.search(r"(?:ASIS|FLAG|CTF|flag|seccon)\{[A-Za-z0-9_!@#$%^&*()+\-=\[\]]{4,}\}", result.text)
-            if flag_match:
-                break
-
-            prog_match = re.search(r"@@CTF_PROGRESS@@\s*(\{.*?\})", result.text)
-            if prog_match:
-                try:
-                    pdata = json.loads(prog_match.group(1))
-                    cand = str(pdata.get("candidate_flag", "")).strip()
-                    if cand and cand not in ("...", "<FLAG>", "FLAG") and "..." not in cand and pdata.get("phase") == "solved":
-                        break
-                except Exception:
-                    pass
-
-            solver_file = Path("solver/solve.py")
-            if solver_file.is_file():
-                try:
-                    content = solver_file.read_text(encoding="utf-8", errors="replace")
-                    if "# TODO" not in content and len(content) > 150 and "solve(" in content:
-                        break
-                except Exception:
-                    pass
-
-            if turn_idx + 1 < max_turns:
-                current_prompt = "Proceed with the next step. Implement the required decoder/exploit logic, execute it, save the recovered flag to ./flag.txt, and write the working solver script to ./solver/solve.py."
-    result = last_result
+    lifecycle_status = result.lifecycle_status or (
+        "completed_turn" if result.status == "completed" else "transport_lost"
+    )
+    output_status = {
+        "completed_turn": "ok",
+        "model_terminal": "terminal",
+    }.get(lifecycle_status, "incomplete")
 
     if getattr(args, "json", False):
         out = {
-            "status": "ok",
+            "status": output_status,
+            "lifecycle_status": lifecycle_status,
             "text": result.text,
             "session_id": sess.local_id,
-            "conversation_id": result.conversation_id,
-            "message_id": result.message_id,
+            "conversation_id": effective_conversation_id,
+            "message_id": effective_msg_id,
             "model": result.model,
             "duration_ms": result.duration_ms,
             "log_dir": str(log_mgr.session_dir(sess.local_id))
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        if lifecycle_status != "completed_turn":
+            sys.stdout.write(f"\n\033[33m⚠️ [Turn Lifecycle: {lifecycle_status}]\033[0m\n")
+            sys.stdout.write("\033[2mConversation pointer has been checkpointed for inspection or an explicit later resume.\033[0m\n\n")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write("\n\n")
+            sys.stdout.flush()
 
 def handle_session(args: argparse.Namespace) -> None:
     reg = SessionRegistry()
@@ -663,6 +651,10 @@ def handle_session(args: argparse.Namespace) -> None:
             sys.exit(1)
         reg.set_active(args.session_id)
         print(f"Active session set to: {args.session_id}")
+
+    elif args.session_action == "new":
+        sess = reg.create_session(tag=getattr(args, "tag", None))
+        print(f"Created fresh session: {sess.local_id} (active)")
 
     elif args.session_action == "delete":
         ok = reg.delete_session(args.session_id)
@@ -813,20 +805,52 @@ def handle_web(args: argparse.Namespace) -> None:
             sys.exit(1)
 
 def main() -> None:
-    known_commands = {"run", "chat", "session", "web", "start", "stop", "restart", "status", "plugin", "mcp", "-h", "--help"}
+    known_commands = {"run", "chat", "session", "new", "newsession", "start", "stop", "restart", "status", "-h", "--help"}
 
     # Case 1: Plain `gpt` with no arguments -> interactive chat!
     if len(sys.argv) == 1:
         asyncio.run(interactive_chat())
         return
 
-    # Case 2: `gpt "some prompt text"` without `run -p`
     first_arg = sys.argv[1]
+    if first_arg in ("plugin", "mcp", "web"):
+        print(f"Notice: The '{first_arg}' command is frozen in this release.", file=sys.stderr)
+        sys.exit(0)
+
+    # Case 1.5: `gpt -n` or `gpt --new`
+    if first_arg in ("-n", "--new"):
+        remaining = sys.argv[2:]
+        if remaining:
+            prompt = " ".join(remaining).strip()
+            args = argparse.Namespace(
+                command="run",
+                prompt=prompt,
+                pos_prompt=[],
+                session=None,
+                new=True,
+                tag=None,
+                model="gpt-5-6-thinking",
+                effort="extended",
+                json=False,
+                bridge=None,
+                no_bridge=False,
+                conv=None,
+            )
+            asyncio.run(handle_run(args))
+            return
+        else:
+            reg = SessionRegistry()
+            sess = reg.create_session()
+            print(f"Started fresh session: {sess.local_id} (active)")
+            return
+
+    # Case 2: `gpt "some prompt text"` without `run -p`
     if first_arg not in known_commands and not first_arg.startswith("-"):
         prompt = " ".join(sys.argv[1:]).strip()
         args = argparse.Namespace(
             command="run",
             prompt=prompt,
+            pos_prompt=[],
             session=None,
             new=False,
             tag=None,
@@ -835,7 +859,7 @@ def main() -> None:
             json=False,
             bridge=None,
             no_bridge=False,
-            conv=None
+            conv=None,
         )
         asyncio.run(handle_run(args))
         return
@@ -849,6 +873,20 @@ def main() -> None:
 
     if args.command == "run":
         asyncio.run(handle_run(args))
+    elif args.command in ("new", "newsession"):
+        pos_parts = getattr(args, "pos_prompt", [])
+        if pos_parts:
+            args.prompt = " ".join(pos_parts).strip()
+            args.new = True
+            args.session = None
+            asyncio.run(handle_run(args))
+        else:
+            reg = SessionRegistry()
+            sess = reg.create_session(tag=getattr(args, "tag", None))
+            if getattr(args, "json", False):
+                print(json.dumps({"session_id": sess.local_id, "tag": sess.tag, "status": "created"}))
+            else:
+                print(f"Started fresh session: {sess.local_id} (active)")
     elif args.command == "chat":
         asyncio.run(interactive_chat(
             model=args.model,
@@ -859,10 +897,6 @@ def main() -> None:
         ))
     elif args.command == "session":
         handle_session(args)
-    elif args.command == "web":
-        handle_web(args)
-    elif args.command in ("plugin", "mcp"):
-        handle_plugin(args)
     elif args.command == "start":
         start_daemon(host=args.host, port=args.port)
     elif args.command == "stop":

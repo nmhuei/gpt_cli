@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import shlex
 import time
 import uuid
@@ -19,6 +20,7 @@ from ..models.registry import ModelRegistry
 from ..transport.wire import WireTransport
 from ..pool.worker_pool import WorkerPool
 from ..session.registry import SessionRegistry
+from ..telemetry.formatter import format_tool_call, format_tool_output
 
 def _extract_content(content_obj: Any) -> str:
     if isinstance(content_obj, str):
@@ -35,83 +37,49 @@ def _extract_content(content_obj: Any) -> str:
                 elif c_type == "tool_result":
                     sub_c = item.get("content", "")
                     sub_text = _extract_content(sub_c)
+                    tool_use_id = item.get("tool_use_id") or item.get("id") or ""
+                    id_suffix = f" (call_id: {tool_use_id})" if tool_use_id else ""
                     prefix = "[Tool Error]" if item.get("is_error") else "[Tool Output]"
-                    parts.append(f"{prefix}: {sub_text}")
+                    parts.append(f"{prefix}{id_suffix}: {sub_text}")
                 elif c_type == "tool_use":
                     t_name = item.get("name", "tool")
                     t_input = item.get("input", {})
-                    parts.append(f"[Tool Call: {t_name} input={json.dumps(t_input)}]")
+                    t_id = item.get("id") or ""
+                    id_suffix = f" call_id={t_id}" if t_id else ""
+                    parts.append(f"[Tool Call: {t_name}{id_suffix} input={json.dumps(t_input)}]")
                 elif c_type == "thinking":
-                    pass
+                    th_text = item.get("thinking") or item.get("text") or ""
+                    if th_text:
+                        parts.append(f"[Thinking]: {th_text}")
         return "\n".join([p for p in parts if p.strip()])
     return str(content_obj or "")
 
 def _resolve_tool_name(raw_name: str, registered: set[str]) -> tuple[str, bool]:
-    """Resolve upstream/wire tool label to registered harness tool name.
-    Returns (resolved_name, should_unwrap_args).
-    """
-    if not registered or raw_name in registered:
+    """Resolve only names advertised by the caller's current tool schema."""
+    if not registered:
         return raw_name, False
 
-    reg_lower_map = {r.lower(): r for r in registered}
-    if raw_name.lower() in reg_lower_map:
-        return reg_lower_map[raw_name.lower()], False
+    raw_name = raw_name.strip()
+    candidates: list[tuple[str, bool]] = [(raw_name, False)]
+    parenthesized = re.search(r"\(([^()]+)\)", raw_name)
+    if parenthesized:
+        candidates.append((parenthesized.group(1).strip(), True))
+    for candidate, unwrap in list(candidates):
+        if "." in candidate:
+            candidates.append((candidate.rsplit(".", 1)[1].strip(), True or unwrap))
 
-    alias_map = {
-        ("functions.exec", "bash", "host_run_command", "python", "terminal", "sh"): ("bash", "execute_command", "sh", "terminal", "run_command", "python"),
-        ("host_list_directory", "list_directory", "dir_list", "ls", "api_tool.list_resources", "list_resources", "resources_list"): ("glob", "bash", "fs_list"),
-        ("host_read_file", "read_file", "file_read", "cat"): ("read", "read_file", "fs_read"),
-        ("host_write_file", "write_file", "file_write"): ("write", "write_file", "fs_write"),
-        ("host_replace_in_file", "edit_file", "replace_file_content"): ("edit", "edit_file", "str_replace_editor"),
-        ("host_search_text", "search_text", "grep"): ("grep", "fs_search", "search"),
-    }
-    raw_lower = raw_name.lower()
-    for reg in registered:
-        if reg.lower().endswith(f"__{raw_lower}"):
-            return reg, False
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
 
-    for sources, targets in alias_map.items():
-        if raw_lower in sources:
-            for cand in targets:
-                if cand.lower() in reg_lower_map:
-                    return reg_lower_map[cand.lower()], False
-                for reg in registered:
-                    if reg.lower().endswith(f"__{cand.lower()}"):
-                        return reg, False
-
-    if "(" in raw_name and ")" in raw_name:
-        inner = raw_name.split("(", 1)[1].split(")", 1)[0].strip()
-        inner_lower = inner.lower()
-        if inner_lower in reg_lower_map:
-            return reg_lower_map[inner_lower], True
-        for reg in registered:
-            if reg.lower().endswith(f"__{inner_lower}"):
-                return reg, True
-        for sources, targets in alias_map.items():
-            if inner_lower in sources:
-                for cand in targets:
-                    if cand.lower() in reg_lower_map:
-                        return reg_lower_map[cand.lower()], True
-                    for reg in registered:
-                        if reg.lower().endswith(f"__{cand.lower()}"):
-                            return reg, True
-
-    if "." in raw_name:
-        tail = raw_name.rsplit(".", 1)[1].strip()
-        tail_lower = tail.lower()
-        if tail_lower in reg_lower_map:
-            return reg_lower_map[tail_lower], True
-        for reg in registered:
-            if reg.lower().endswith(f"__{tail_lower}"):
-                return reg, True
-        for sources, targets in alias_map.items():
-            if tail_lower in sources:
-                for cand in targets:
-                    if cand.lower() in reg_lower_map:
-                        return reg_lower_map[cand.lower()], True
-                    for reg in registered:
-                        if reg.lower().endswith(f"__{cand.lower()}"):
-                            return reg, True
+    indexed = {normalized(name): name for name in registered}
+    for candidate, unwrap in candidates:
+        key = normalized(candidate)
+        if key in indexed:
+            return indexed[key], unwrap
+        key_parts = key.split("_")
+        matches = [name for name in registered if normalized(name).split("_")[-len(key_parts):] == key_parts]
+        if len(matches) == 1:
+            return matches[0], unwrap
 
     return raw_name, False
 
@@ -201,17 +169,8 @@ def _normalize_tool_payload(resolved_name: str, raw_payload: Any, should_unwrap:
 
     return obj
 
-def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> str:
-    """Prepend active bridge mention (e.g. '@br ') if not already present."""
-    p = prompt.strip()
-    if not bridge_name or str(bridge_name).lower() in ("off", "none", "false"):
-        return p
-    clean_bridge = str(bridge_name).lstrip("@").strip()
-    if not clean_bridge:
-        return p
-    if p.startswith(f"@{clean_bridge} ") or p == f"@{clean_bridge}":
-        return p
-    return f"@{clean_bridge} {p}"
+from ..core.bridge import resolve_prompt_with_bridge
+
 
 def _is_session_title_request(messages: list[dict[str, Any]], system_text: str = "") -> bool:
     s_low = (system_text or "").lower()
@@ -246,7 +205,7 @@ def format_chat_messages(
     system_prompt: str | None = None,
     tools: list[dict[str, Any]] | None = None,
 ) -> str:
-    if len(messages) == 1 and messages[0].get("role") == "user":
+    if not system_prompt and not tools and len(messages) == 1 and messages[0].get("role") == "user":
         return _extract_content(messages[0].get("content", "")).strip()
 
     rendered: list[str] = []
@@ -328,8 +287,10 @@ async def chat_completions(request: Request) -> Response:
         })
 
     settings = Settings()
-    prompt = format_chat_messages(messages)
-    prompt = resolve_prompt_with_bridge(prompt, settings.default_bridge_name)
+    tools_list = body.get("tools", [])
+    active_bridge = None if tools_list else settings.default_bridge_name
+    prompt = format_chat_messages(messages, tools=tools_list)
+    prompt = resolve_prompt_with_bridge(prompt, active_bridge)
 
     cache_mgr = TokenCacheManager()
     bundle = cache_mgr.load_disk_cache()
@@ -412,35 +373,21 @@ async def chat_completions(request: Request) -> Response:
             elif ev.event_type == "tool_call_started":
                 tool_label = ev.data.get("tool") or ev.data.get("name") or "tool"
                 payload = ev.data.get("payload") or ""
-                if isinstance(payload, (dict, list)):
-                    payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
-                else:
-                    try:
-                        p_obj = json.loads(payload)
-                        payload_str = json.dumps(p_obj, ensure_ascii=False, indent=2)
-                    except Exception:
-                        payload_str = str(payload)
-                tool_block = f"\n🔧 [Tool Call: {tool_label}]\n📥 Input:\n```json\n{payload_str}\n```\n"
+                title, input_details = format_tool_call(tool_label, payload)
+                tool_block = f"\n{title}\n"
+                if input_details:
+                    tool_block += f"📥 {input_details}\n"
                 queue.put_nowait({
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "choices": [{"index": 0, "delta": {"reasoning_content": tool_block}, "finish_reason": None}]
                 })
             elif ev.event_type == "tool_call_finished":
+                tool_label = ev.data.get("tool") or ev.data.get("name") or "tool"
                 output = ev.data.get("output") or ""
                 title = ev.data.get("title") or ""
-                if isinstance(output, (dict, list)):
-                    out_str = json.dumps(output, ensure_ascii=False, indent=2)
-                else:
-                    try:
-                        o_obj = json.loads(output)
-                        out_str = json.dumps(o_obj, ensure_ascii=False, indent=2)
-                    except Exception:
-                        out_str = str(output)
-                if len(out_str) > 3000:
-                    out_str = out_str[:3000] + f"\n... [truncated {len(out_str) - 3000} bytes]"
-                header = f"📤 Output ({title}):" if title else "📤 Output:"
-                tool_block = f"{header}\n```json\n{out_str}\n```\n\n"
+                formatted_out = format_tool_output(tool_label, output, title)
+                tool_block = f"📤 Output:\n{formatted_out}\n\n"
                 queue.put_nowait({
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -517,34 +464,48 @@ async def anthropic_messages(request: Request) -> Response:
 
     tools = body.get("tools", [])
     registered_tools = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
-    header_keys = {k: v for k, v in request.headers.items() if k.lower() not in ("authorization", "cookie")}
+    header_keys = {k: v for k, v in request.headers.items() if k.lower() not in ("authorization", "cookie", "x-api-key")}
     print(f"[GATEWAY] POST /v1/messages: msgs={len(messages)}, registered_tools={list(registered_tools)}, system_len={len(system_text)}, headers={header_keys}", flush=True)
 
-    session_key = (
-        request.headers.get("x-deepseek-harness-session-id")
-        or request.headers.get("x-claude-code-session-id")
-        or request.headers.get("x-session-id")
-        or request.headers.get("x-conversation-id")
-        or (body.get("metadata") or {}).get("session_id")
-    )
+    metadata = body.get("metadata") or {}
+    purpose = str(metadata.get("purpose") or body.get("purpose") or "").lower()
+    is_compaction = (purpose == "compaction")
+
+    session_key = None
+    if not is_compaction:
+        session_key = (
+            request.headers.get("x-deepseek-harness-session-id")
+            or request.headers.get("x-claude-code-session-id")
+            or request.headers.get("x-session-id")
+            or request.headers.get("x-conversation-id")
+            or metadata.get("session_id")
+        )
     sess = None
     conv_id = None
     parent_id = None
     if session_key:
         reg = SessionRegistry()
-        sess = reg.get_or_create(session_id=f"sess_{str(session_key).replace('-', '_')}")
+        clean_key = str(session_key).replace("-", "_")
+        sess_id = clean_key if clean_key.startswith("sess_") else f"sess_{clean_key}"
+        sess = reg.get_or_create(session_id=sess_id, set_active=False)
         conv_id = sess.conversation_id
         parent_id = sess.last_message_id
 
     settings = Settings()
     if conv_id and parent_id and len(messages) > 1:
-        prompt = format_chat_messages(messages[-1:], tools=tools)
+        # Prefix Diffing: Extract all messages since the last assistant message
+        last_asst_idx = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+        delta_messages = messages[last_asst_idx + 1:] if last_asst_idx >= 0 else messages[-1:]
+        if not delta_messages:
+            delta_messages = messages[-1:]
+        prompt = format_chat_messages(delta_messages, tools=tools)
     else:
         conv_id = None
         parent_id = None
         prompt = format_chat_messages(messages, system_prompt=system_text, tools=tools)
 
-    prompt = resolve_prompt_with_bridge(prompt, settings.default_bridge_name)
+    active_bridge = None if registered_tools else settings.default_bridge_name
+    prompt = resolve_prompt_with_bridge(prompt, active_bridge)
     effort = "extended"
 
     cache_mgr = TokenCacheManager()
@@ -599,7 +560,7 @@ async def anthropic_messages(request: Request) -> Response:
                 )
 
         result = await pool.execute(do_turn)
-        if sess:
+        if sess and not is_compaction:
             final_c = captured_conv_id or result.conversation_id
             final_m = captured_msg_id or result.message_id
             if final_c and final_m:
@@ -629,7 +590,7 @@ async def anthropic_messages(request: Request) -> Response:
 
         has_tool = bool(captured_tools)
         has_text = bool(result.text.strip())
-        stop_reason = "tool_use" if has_tool else "end_turn"
+        stop_reason = "tool_use" if (has_tool and not has_text) else "end_turn"
 
         return JSONResponse({
             "id": msg_id,
@@ -857,11 +818,16 @@ async def anthropic_messages(request: Request) -> Response:
                         effort=effort,
                         on_event=on_event
                     )
-                    if sess:
+                    if sess and not is_compaction:
                         final_c = captured_conv_id or turn_res.conversation_id
                         final_m = captured_msg_id or turn_res.message_id
                         if final_c and final_m:
                             reg.update_turn(sess.local_id, conversation_id=final_c, last_message_id=final_m, model=model_alias)
+            except (asyncio.CancelledError, Exception):
+                if sess and not is_compaction:
+                    if captured_conv_id and captured_msg_id:
+                        reg.update_turn(sess.local_id, conversation_id=captured_conv_id, last_message_id=captured_msg_id, model=model_alias)
+                raise
             finally:
                 queue.put_nowait(None)
 
@@ -876,6 +842,10 @@ async def anthropic_messages(request: Request) -> Response:
         finally:
             if not task.done():
                 task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

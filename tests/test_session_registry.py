@@ -66,6 +66,19 @@ def test_session_persistence(tmp_path: Path):
     assert loaded.conversation_id == "conv_p1"
     assert loaded.last_message_id == "msg_p1"
 
+
+def test_checkpoint_preserves_pointer_without_incrementing_completed_turns(tmp_path: Path):
+    reg = SessionRegistry(storage_dir=tmp_path)
+    session = reg.create_session()
+
+    reg.checkpoint(session.local_id, "conv_live", "node_live", "gpt-5-6-thinking")
+
+    saved = reg.get_session(session.local_id)
+    assert saved is not None
+    assert (saved.conversation_id, saved.last_message_id, saved.model, saved.turns) == (
+        "conv_live", "node_live", "gpt-5-6-thinking", 0,
+    )
+
 def test_concurrent_session_registry_writers(tmp_path: Path):
     import concurrent.futures
     storage_dir = tmp_path / "concurrent_sessions"

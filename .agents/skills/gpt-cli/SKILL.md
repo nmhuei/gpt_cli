@@ -207,22 +207,20 @@ Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file
 
 ## 4. Cẩm Nang Chẩn Đoán & Tự Sửa Lỗi (Agent Troubleshooting & Self-Healing)
 
-### Lỗi 1: HTTP 403 Forbidden / Token Hết Hạn / Cloudflare Clearance Stale
-- **Triệu chứng:** `RuntimeError: ChatGPT Web POST returned HTTP 403: ...` hoặc Sentinel prepare trả về 403.
-- **Nguyên nhân:** Token truy cập hết hạn hoặc Cloudflare clearance cookie bị xoay.
-- **Cách khắc phục:**
-  1. Kích hoạt `BrowserLifebuoy` để tự động mở Chromium ngầm trong 3 giây và re-mint token:
-     ```python
-     from gpt_cli.core.token_cache import TokenCacheManager
-     from gpt_cli.transport.lifebuoy import BrowserLifebuoy
-     
-     cache_mgr = TokenCacheManager()
-     lifebuoy = BrowserLifebuoy(cache_mgr)
-     bundle = await lifebuoy.remint_credentials(headless=True)
-     ```
-  2. Nếu headless thất bại do Cloudflare Turnstile tương tác người dùng, mở trình duyệt bằng script profile để đăng nhập lại:
+### Lỗi 1: HTTP 401 Unauthorized / HTTP 403 Forbidden (BẮT BUỘC KIỂM TRA LOGIC)
+- **Quy tắc cốt lõi:** Tài khoản người dùng **KHÔNG CÓ GIỚI HẠN QUOTA THÔNG THƯỜNG / KHÔNG CÓ CHUYỆN HẾT HẠN TOKEN TỰ NHIÊN**.
+- **Triệu chứng:** `RuntimeError: ChatGPT Web POST returned HTTP 401/403` hoặc Sentinel prepare trả về 401/403.
+- **Nguyên nhân thực tế (99% là lỗi logic giao thức):**
+  1. *Cookie formatting:* Chuỗi header `Cookie` bị thiếu các trường thiết yếu (`cf_clearance`, `__Secure-next-auth.session-token`, `_puid`).
+  2. *Header `ChatGPT-Account-ID`:* Bị rỗng hoặc mang ID không khớp với token.
+  3. *Sentinel & PoW:* Hash build `_SENTINEL_BUILD_HASH` lỗi thời, hoặc seed/difficulty SHA3-512 bị giải sai, format prefix `gAAAAAB...` không chuẩn.
+  4. *Device ID Mismatch:* `oai-device-id` bị lệch giữa Sentinel handshake và endpoint `/backend-api/f/conversation`.
+  5. *TLS ClientHello / User-Agent:* Fingerprint `curl_cffi` bị lệch với User-Agent Windows.
+- **Cách xử lý chuẩn (Engineering First):**
+  1. **Bước 1 (Ưu tiên số 1):** In toàn bộ headers, cookies, và payload request ra để kiểm tra định dạng logic trong [`gpt_cli/transport/conduit.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/conduit.py) và [`gpt_cli/transport/wire.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/wire.py).
+  2. **Bước 2:** Kiểm tra hạn JWT `accessToken` và thử tự động refresh qua token cache API.
+  3. **Bước 3 (Chỉ dùng khi Cloudflare Turnstile tương tác thật sự):** Nếu và chỉ nếu Cloudflare chặn IP hoặc yêu cầu giải captcha tương tác người dùng, mới sử dụng Browser để đồng bộ lại clearance:
      ```bash
-     cd /home/light/GitHub/gpt_cli
      .venv/bin/python -m gpt_cli.transport.lifebuoy --interactive
      ```
 
