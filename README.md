@@ -7,11 +7,11 @@ Runtime tinh gọn, chuyên biệt, tốc độ cao được xây dựng lại t
 ## 1. Tính Năng Cốt Lõi
 
 - **0 MB Browser RAM (Wire Conduit)**: Giao tiếp trực tiếp qua kết nối HTTP/2 TLS impersonate bằng `curl_cffi`, giải thuật toán PoW SHA3-512 nội bộ bằng Python thuần.
-- **Failover Browser Lifebuoy**: Chromium chỉ được đánh thức trong 3-5s khi gặp HTTP 403 để làm mới token rồi ngủ đông ngay lập tức.
+- **Failover Browser Lifebuoy**: chỉ là phương án cuối khi JWT thực sự thiếu/hết hạn; lỗi 401/403 phải được chẩn đoán cookie, workspace, Sentinel/PoW, device ID và TLS trước.
 - **Khóa Cứng Flagship Model**: Ghim chặt `gpt-5-6-thinking` với `thinking_effort="extended"` (High Thinking 3/3). Tuyệt đối ngăn chặn downgrade về mini.
 - **Hỗ trợ tối đa 5 Workers Song Song**: Đạt 100% throughput đồng thời trên 5 session khác nhau mà không bị dính rate-limit 429.
 - **Live Stream Telemetry**: Bóc tách trực tiếp từng frame SSE từ socket (Thinking reasoning, Web Search queries, Tool invocations) xuất ra `live_telemetry.jsonl`.
-- **Headless Session Management**: Quản lý cây hội thoại riêng của tool (`tool_sessions.json`), tự động duy trì ngữ cảnh cho các lượt chat nối tiếp.
+- **Headless Session Management**: mỗi prompt mặc định tạo local session/remote conversation mới; chỉ `--resume` hoặc `--resume-session` mới tiếp tục DAG đã có.
 - **Tách Biệt Hoàn Toàn với BQA**: BQA (`botquanganh_mcp`) đảm nhiệm 100% việc thực thi lệnh host qua Cloudflare; `gpt_cli` chỉ làm nhiệm vụ Gateway, Monitor và Session Keeper.
 
 ---
@@ -43,11 +43,21 @@ gpt_cli/
 # Chạy prompt nhanh và nhận JSON output
 gpt run --prompt "Phân tích file..." --json
 
-# Tạo session mới hoàn toàn
-gpt run --new --tag "task-1" --prompt "..." --json
+# Mỗi prompt mặc định là session/conversation mới
+gpt run --tag "task-1" --prompt "..." --json
 
-# Tiếp tục session cụ thể
-gpt run --session sess_8f3a12 --prompt "..." --json
+# Tiếp tục active session hoặc một session cụ thể
+gpt run --resume --prompt "Tiếp tục kiểm tra kết quả"
+gpt run --resume-session sess_8f3a12 --prompt "Tiếp tục bài trước" --json
+
+# Thêm chỉ dẫn vào session đang thực sự chạy.
+# Nếu upstream không có native async steer, nó được xếp FIFO sau turn hiện tại.
+gpt steer "Ưu tiên chạy test trước"
+gpt steer --resume-session sess_8f3a12 --json "Không sửa file cấu hình"
+
+# Chọn native ChatGPT connector mention; đây không provision MCP connector.
+gpt run --bridge br "Kiểm tra dịch vụ"
+gpt run --no-bridge "Trả lời thuần văn bản"
 
 # Xem danh sách session do tool tạo ra
 gpt session list --json
@@ -60,7 +70,19 @@ gpt stop
 
 ---
 
-## 4. Tài Liệu Kỹ Thuật
+## 4. Benchmark lifecycle
+
+Benchmark deterministic không gọi network, ghi cả JSON và Markdown để so sánh các thay đổi lifecycle:
+
+```bash
+python benchmarks/session_lifecycle.py --output ~/Downloads/test_gpt_cli_benchmark
+```
+
+Nó đo 5 fresh turns chạy song song, DAG-resume fixture, thứ tự steer FIFO và invariant không gọi Browser Lifebuoy. Đây là benchmark cơ chế nội bộ; không được diễn giải như latency mạng ChatGPT thực tế.
+
+---
+
+## 5. Tài Liệu Kỹ Thuật
 
 - [Bản Thiết Kế Kiến Trúc Chi Tiết](docs/ARCHITECTURE.md)
 - [Kế Hoạch Thi Công Từng Task](docs/IMPLEMENTATION_PLAN.md)
