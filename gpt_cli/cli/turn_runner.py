@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,22 @@ class SessionTurnRunner:
                         captured_thoughts.append(summary)
             elif event.event_type == "tool_call_started":
                 captured_tools.append(dict(event.data))
+            elif event.event_type == "tool_call_finished":
+                output = event.data.get("output")
+                try:
+                    payload = json.loads(output) if isinstance(output, str) else output
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    chat_id = payload.get("chat_id") or payload.get("session_id")
+                    workspace_path = payload.get("workspace") or payload.get("workspace_dir")
+                    if isinstance(chat_id, str) or isinstance(workspace_path, str):
+                        self.registry.bind_workspace(
+                            self.session.local_id,
+                            chat_id=chat_id if isinstance(chat_id, str) else None,
+                            workspace_path=workspace_path if isinstance(workspace_path, str) else None,
+                        )
+                        self.session = self.registry.require_session(self.session.local_id)
             if self.emit_event is not None:
                 self.emit_event(event)
 

@@ -221,6 +221,27 @@ class SessionRegistry:
             self._save()
             return SessionRecord(**session)
 
+    def bind_workspace(
+        self,
+        local_id: str,
+        *,
+        chat_id: str | None,
+        workspace_path: str | None,
+    ) -> SessionRecord | None:
+        """Persist the workspace identity returned by a host bind tool."""
+        with self._lock():
+            self._load()
+            session = self._data.get("sessions", {}).get(local_id)
+            if session is None:
+                return None
+            if chat_id:
+                session["bqa_chat_id"] = chat_id
+            if workspace_path:
+                session["bqa_workspace_path"] = workspace_path
+            session["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save()
+            return SessionRecord(**session)
+
     def list_sessions(self) -> list[SessionRecord]:
         with self._lock():
             self._load()

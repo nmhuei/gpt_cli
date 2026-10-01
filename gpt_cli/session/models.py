@@ -8,6 +8,8 @@ class SessionRecord:
     last_message_id: str | None = None
     tag: str | None = None
     model: str | None = None
+    bqa_chat_id: str | None = None
+    bqa_workspace_path: str | None = None
     created_at: str = ""
     updated_at: str = ""
     turns: int = 0

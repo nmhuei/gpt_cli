@@ -68,6 +68,23 @@ def test_cli_parser_session_command():
     assert args.session_action == "list"
     assert args.json is True
 
+
+def test_session_new_json_emits_the_durable_local_id(monkeypatch, tmp_path, capsys):
+    """An external scheduler must know the ID before it starts a worker."""
+    from argparse import Namespace
+    from gpt_cli.cli.main import handle_session
+
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+
+    handle_session(Namespace(session_action="new", tag="ctf:crypto:1", json=True))
+
+    created = __import__("json").loads(capsys.readouterr().out)
+    assert created["session_id"].startswith("sess_")
+    assert created["tag"] == "ctf:crypto:1"
+    assert created["turns"] == 0
+    assert SessionRegistry(tmp_path / "sessions").require_session(created["session_id"]).tag == "ctf:crypto:1"
+
 def test_cli_parser_gateway_command():
     parser = build_cli_parser()
     args = parser.parse_args(["start", "--port", "18000"])

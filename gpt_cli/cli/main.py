@@ -82,6 +82,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     # session new
     new_sess_p = sess_sub.add_parser("new", help="Create a fresh session and set as active")
     new_sess_p.add_argument("-t", "--tag", default=None, help="Tag for the new session")
+    new_sess_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
     # session delete
     del_p = sess_sub.add_parser("delete", help="Delete a session")
@@ -495,6 +496,7 @@ async def handle_run(args: argparse.Namespace) -> None:
             emit_event=on_event_with_timer,
         )
         result = await runner.run_initial(wire_prompt)
+        sess = reg.require_session(sess.local_id)
     except KeyboardInterrupt:
         if not getattr(args, "json", False):
             sys.stdout.write(f"\n\n\033[1;33m⏸️ [Interrupted by User] Session saved: {sess.local_id}\033[0m\n")
@@ -539,6 +541,8 @@ async def handle_run(args: argparse.Namespace) -> None:
             "session_id": sess.local_id,
             "conversation_id": effective_conversation_id,
             "message_id": effective_msg_id,
+            "bqa_chat_id": sess.bqa_chat_id,
+            "bqa_workspace_path": sess.bqa_workspace_path,
             "model": result.model,
             "duration_ms": result.duration_ms,
             "log_dir": str(log_mgr.session_dir(sess.local_id))
@@ -678,7 +682,15 @@ def handle_session(args: argparse.Namespace) -> None:
 
     elif args.session_action == "new":
         sess = reg.create_session(tag=getattr(args, "tag", None))
-        print(f"Created fresh session: {sess.local_id} (active)")
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "status": "created",
+                "session_id": sess.local_id,
+                "tag": sess.tag,
+                "turns": sess.turns,
+            }, ensure_ascii=False))
+        else:
+            print(f"Created fresh session: {sess.local_id} (active)")
 
     elif args.session_action == "delete":
         ok = reg.delete_session(args.session_id)

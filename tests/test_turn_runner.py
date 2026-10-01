@@ -10,9 +10,10 @@ from gpt_cli.telemetry.events import TelemetryEvent
 
 
 class FakeWireTransport:
-    def __init__(self, release_first: asyncio.Event, native_steer: bool = False):
+    def __init__(self, release_first: asyncio.Event, native_steer: bool = False, workspace_output: str | None = None):
         self.release_first = release_first
         self.native_steer = native_steer
+        self.workspace_output = workspace_output
         self.initial_started = asyncio.Event()
         self.calls: list[tuple[str, str | None, str | None]] = []
         self.steer_prompts: list[str] = []
@@ -33,6 +34,10 @@ class FakeWireTransport:
             on_event(TelemetryEvent("message_id", {"message_id": f"msg_{index}"}))
             if self.native_steer and index == 1:
                 on_event(TelemetryEvent("async_task", {"async_task_id": "task_1", "async_task_turn_id": "turn_1"}))
+            if self.workspace_output and index == 1:
+                on_event(TelemetryEvent("tool_call_finished", {
+                    "tool": "host_workspace_bind", "output": self.workspace_output,
+                }))
         if index == 1:
             self.initial_started.set()
             await self.release_first.wait()
@@ -106,5 +111,24 @@ def test_runner_reports_native_steer_without_enqueuing_followup_turn(tmp_path: P
 
         assert fake.steer_prompts == ["answer now"]
         assert [call[0] for call in fake.calls] == ["initial"]
+
+    asyncio.run(run())
+
+
+def test_runner_persists_bound_bqa_workspace_from_tool_result(tmp_path: Path):
+    async def run() -> None:
+        release = asyncio.Event()
+        release.set()
+        fake = FakeWireTransport(
+            release,
+            workspace_output='{"chat_id":"cw-ctf-one","workspace":"/tmp/bqa/one"}',
+        )
+        runner, registry = _runner(tmp_path, fake)
+
+        await runner.run_initial("solve /tmp/challenge")
+
+        saved = registry.require_session("sess_one")
+        assert saved.bqa_chat_id == "cw-ctf-one"
+        assert saved.bqa_workspace_path == "/tmp/bqa/one"
 
     asyncio.run(run())
