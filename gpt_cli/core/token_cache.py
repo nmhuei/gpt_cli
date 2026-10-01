@@ -31,6 +31,23 @@ class TokenCacheManager:
             pass
         return False
 
+    def extract_account_id(self, token: str) -> str | None:
+        """Extract chatgpt_account_id claim from JWT token payload."""
+        if not token or not isinstance(token, str):
+            return None
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+                auth_claim = payload.get("https://api.openai.com/auth")
+                if isinstance(auth_claim, dict) and auth_claim.get("chatgpt_account_id"):
+                    return auth_claim["chatgpt_account_id"]
+                return payload.get("chatgpt_account_id")
+        except Exception:
+            pass
+        return None
+
     def load_disk_cache(self) -> TokenBundle | None:
         if not self.cache_file.exists():
             return None
@@ -40,12 +57,15 @@ class TokenCacheManager:
             cookies = data.get("cookies", {})
             if not token and not cookies:
                 return None
+            account_id = data.get("chatgpt_account_id") or data.get("account_id") or data.get("accountId")
+            if not account_id and token:
+                account_id = self.extract_account_id(token)
             return TokenBundle(
                 access_token=token,
                 cookies=cookies,
                 oai_device_id=data.get("oai_device_id") or data.get("oaiDeviceId"),
                 cf_clearance=data.get("cf_clearance") or data.get("cfClearance"),
-                chatgpt_account_id=data.get("chatgpt_account_id") or data.get("account_id") or data.get("accountId"),
+                chatgpt_account_id=account_id,
             )
         except Exception:
             return None

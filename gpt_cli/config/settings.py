@@ -53,6 +53,13 @@ class Settings:
     default_mcp_tunnel_file: Path = field(
         default_factory=lambda: Path(os.getenv("DEFAULT_MCP_TUNNEL_FILE", str(defaults.default_mcp_tunnel_file()))).expanduser()
     )
+    # BQA is a local, redacted host-activity side channel.  It is deliberately
+    # independent of the public MCP tunnel and only used for bound sessions.
+    bqa_activity_url: str = field(
+        default_factory=lambda: os.getenv(
+            "BQA_ACTIVITY_URL", "http://127.0.0.1:18427/api/v1/activity/stream"
+        ).rstrip("/")
+    )
 
     def resolve_mcp_url(self, explicit_url: str | None = None) -> str:
         """Resolves target MCP URL: explicit -> env static -> dynamic tunnel file."""

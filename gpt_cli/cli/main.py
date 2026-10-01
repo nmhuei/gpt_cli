@@ -17,7 +17,7 @@ from ..session.live_turns import LiveTurnRegistry
 from ..session.turn_control import request_steer
 from ..transport.wire import WireTransport
 from ..server.daemon import start_daemon, stop_daemon, status_daemon
-from ..telemetry.formatter import format_tool_call, format_tool_output
+from ..telemetry.presenter import TerminalTelemetryPresenter
 from .turn_runner import SessionTurnRunner
 
 def build_cli_parser() -> argparse.ArgumentParser:
@@ -221,61 +221,28 @@ async def interactive_chat(
         captured_thoughts: list[str] = []
         captured_tools: list[dict[str, Any]] = []
         printed_telemetry: set[str] = set()
+        presenter = TerminalTelemetryPresenter(sys.stdout)
 
         def on_event(ev):
             if ev.event_type == "delta":
                 sys.stdout.write(ev.data.get("text", ""))
                 sys.stdout.flush()
-            elif ev.event_type == "thinking":
-                title = ev.data.get("title")
-                if title and title not in printed_telemetry:
-                    printed_telemetry.add(title)
-                    sys.stdout.write(f"\033[2m💭 [Thinking] {title}\033[0m\n")
-                    sys.stdout.flush()
-                for th in ev.data.get("thoughts", []):
-                    summ = th.get("summary") if isinstance(th, dict) else str(th)
-                    if summ and summ not in printed_telemetry:
-                        printed_telemetry.add(summ)
-                        captured_thoughts.append(summ)
-                        sys.stdout.write(f"\033[2m💭 [Thinking] {summ}\033[0m\n")
-                        sys.stdout.flush()
-            elif ev.event_type == "reasoning_recap":
-                recap_str = ev.data.get("recap")
-                if recap_str and recap_str not in printed_telemetry:
-                    printed_telemetry.add(recap_str)
-                    sys.stdout.write(f"\033[2m⏱️ [{recap_str}]\033[0m\n")
-                    sys.stdout.flush()
-            elif ev.event_type == "tool_call_started":
-                captured_tools.append(ev.data)
-                call_id = ev.data.get("id")
-                if not call_id or call_id not in printed_telemetry:
-                    if call_id:
-                        printed_telemetry.add(call_id)
-                    tool_name = ev.data.get("tool", "tool")
-                    payload = ev.data.get("payload")
-                    title, details = format_tool_call(tool_name, payload)
-                    sys.stdout.write(f"\n\033[36m{title}\033[0m\n")
-                    if details:
-                        sys.stdout.write(f"\033[2m{details}\033[0m\n")
-                    sys.stdout.flush()
-            elif ev.event_type == "tool_call_finished":
-                call_id = ev.data.get("id")
-                fin_key = f"fin_{call_id}" if call_id else None
-                if not fin_key or fin_key not in printed_telemetry:
-                    if fin_key:
-                        printed_telemetry.add(fin_key)
-                    tool_name = ev.data.get("tool", "")
-                    title = ev.data.get("title") or ""
-                    output = ev.data.get("output") or ""
-                    fmt_out = format_tool_output(tool_name, output, title=title)
-                    out_str = fmt_out[:2000] if fmt_out else ""
-                    if len(fmt_out) > 2000:
-                        out_str += f"\n... [truncated {len(fmt_out) - 2000} bytes]"
-                    sys.stdout.write(f"\033[36m📤 [Tool Result]\033[0m\n")
-                    if out_str:
-                        sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
-                    sys.stdout.flush()
-            elif ev.event_type == "web_search":
+                return
+            if ev.event_type == "thinking":
+                for thought in ev.data.get("thoughts", []):
+                    summary = thought.get("summary") if isinstance(thought, dict) else str(thought)
+                    if summary:
+                        captured_thoughts.append(summary)
+                presenter.emit(ev)
+                return
+            if ev.event_type == "tool_call_started":
+                captured_tools.append(dict(ev.data))
+                presenter.emit(ev)
+                return
+            if ev.event_type in {"tool_call_finished", "reasoning_recap", "recovery_started"}:
+                presenter.emit(ev)
+                return
+            if ev.event_type == "web_search":
                 queries = ev.data.get("queries", [])
                 q_str = ", ".join(queries) if queries else ""
                 if q_str and q_str not in printed_telemetry:
@@ -373,11 +340,13 @@ async def handle_run(args: argparse.Namespace) -> None:
     captured_thoughts: list[str] = []
     captured_tools: list[dict[str, Any]] = []
     printed_telemetry: set[str] = set()
+    presenter = None if getattr(args, "json", False) else TerminalTelemetryPresenter(sys.stdout)
     checkpoint_conversation_id = sess.conversation_id
     checkpoint_message_id = sess.last_message_id
+    printed_any_delta = False
 
     def on_event(ev):
-        nonlocal checkpoint_conversation_id, checkpoint_message_id
+        nonlocal checkpoint_conversation_id, checkpoint_message_id, printed_any_delta
         is_json = getattr(args, "json", False)
 
         if ev.event_type == "conversation_id":
@@ -395,63 +364,35 @@ async def handle_run(args: argparse.Namespace) -> None:
         if ev.event_type == "delta":
             delta_text = ev.data.get("text", "")
             if not is_json:
+                printed_any_delta = True
                 sys.stdout.write(delta_text)
                 sys.stdout.flush()
-        elif ev.event_type == "thinking":
-            title = ev.data.get("title")
-            if title and title not in printed_telemetry:
-                printed_telemetry.add(title)
-                if not is_json:
-                    sys.stdout.write(f"\033[2m💭 [Thinking] {title}\033[0m\n")
-                    sys.stdout.flush()
-            for th in ev.data.get("thoughts", []):
-                summ = th.get("summary") if isinstance(th, dict) else str(th)
-                if summ and summ not in printed_telemetry:
-                    printed_telemetry.add(summ)
-                    captured_thoughts.append(summ)
-                    if not is_json:
-                        sys.stdout.write(f"\033[2m💭 [Thinking] {summ}\033[0m\n")
-                        sys.stdout.flush()
-        elif ev.event_type == "reasoning_recap":
-            recap_str = ev.data.get("recap")
-            if recap_str and recap_str not in printed_telemetry:
-                printed_telemetry.add(recap_str)
-                if not is_json:
-                    sys.stdout.write(f"\033[2m⏱️ [{recap_str}]\033[0m\n")
-                    sys.stdout.flush()
-        elif ev.event_type == "tool_call_started":
-            captured_tools.append(ev.data)
-            call_id = ev.data.get("id")
-            if not call_id or call_id not in printed_telemetry:
-                if call_id:
-                    printed_telemetry.add(call_id)
-                tool_name = ev.data.get("tool", "tool")
-                payload = ev.data.get("payload")
-                if not is_json:
-                    title, details = format_tool_call(tool_name, payload)
-                    sys.stdout.write(f"\n\033[36m{title}\033[0m\n")
-                    if details:
-                        sys.stdout.write(f"\033[2m{details}\033[0m\n")
-                    sys.stdout.flush()
-        elif ev.event_type == "tool_call_finished":
-            call_id = ev.data.get("id")
-            fin_key = f"fin_{call_id}" if call_id else None
-            if not fin_key or fin_key not in printed_telemetry:
-                if fin_key:
-                    printed_telemetry.add(fin_key)
-                tool_name = ev.data.get("tool", "")
-                title = ev.data.get("title") or ""
-                output = ev.data.get("output") or ""
-                if not is_json:
-                    fmt_out = format_tool_output(tool_name, output, title=title)
-                    out_str = fmt_out[:2000] if fmt_out else ""
-                    if len(fmt_out) > 2000:
-                        out_str += f"\n... [truncated {len(fmt_out) - 2000} bytes]"
-                    sys.stdout.write(f"\033[36m📤 [Tool Result]\033[0m\n")
-                    if out_str:
-                        sys.stdout.write(f"\033[2m{out_str}\033[0m\n")
-                    sys.stdout.flush()
-        elif ev.event_type == "web_search":
+            return
+        if ev.event_type == "thinking":
+            for thought in ev.data.get("thoughts", []):
+                summary = thought.get("summary") if isinstance(thought, dict) else str(thought)
+                if summary and summary not in captured_thoughts:
+                    captured_thoughts.append(summary)
+            if presenter is not None:
+                presenter.emit(ev)
+            return
+        if ev.event_type == "reasoning_recap":
+            recap = ev.data.get("recap")
+            if recap and recap not in captured_thoughts:
+                captured_thoughts.append(recap)
+            if presenter is not None:
+                presenter.emit(ev)
+            return
+        if ev.event_type == "tool_call_started":
+            captured_tools.append(dict(ev.data))
+            if presenter is not None:
+                presenter.emit(ev)
+            return
+        if ev.event_type in {"tool_call_finished", "recovery_started"}:
+            if presenter is not None:
+                presenter.emit(ev)
+            return
+        if ev.event_type == "web_search":
             queries = ev.data.get("queries", [])
             q_str = ", ".join(queries) if queries else ""
             if q_str and q_str not in printed_telemetry:
@@ -559,6 +500,9 @@ async def handle_run(args: argparse.Namespace) -> None:
         }
         print(json.dumps(out, ensure_ascii=False))
     else:
+        if not printed_any_delta and result.text:
+            sys.stdout.write(result.text)
+            sys.stdout.flush()
         if lifecycle_status != "completed_turn":
             sys.stdout.write(f"\n\033[33m⚠️ [Turn Lifecycle: {lifecycle_status}]\033[0m\n")
             if result.error:

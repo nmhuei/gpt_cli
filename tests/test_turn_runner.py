@@ -191,3 +191,27 @@ def test_runner_persists_bound_bqa_workspace_from_tool_result(tmp_path: Path):
         assert saved.bqa_workspace_path == "/tmp/bqa/one"
 
     asyncio.run(run())
+
+
+def test_runner_pairs_recovered_tool_result_and_records_recovery(tmp_path: Path):
+    class RecoveredFake(FakeWireTransport):
+        async def send_turn(self, *args, on_event=None, **kwargs):
+            assert on_event is not None
+            on_event(TelemetryEvent("recovery_started", {"source": "dag", "reason": "sse_interrupted"}))
+            on_event(TelemetryEvent("tool_call_started", {"id": "call_1", "tool": "health_check", "payload": "{}", "source": "dag"}))
+            on_event(TelemetryEvent("tool_call_finished", {"id": "call_1", "tool": "health_check", "output": '{"ok":true}', "source": "dag"}))
+            return TurnResult(text="healthy", conversation_id="conv_1", message_id="msg_1", model="gpt-5-6-thinking")
+
+    async def run() -> None:
+        release = asyncio.Event()
+        release.set()
+        runner, _ = _runner(tmp_path, RecoveredFake(release))
+        await runner.run_initial("status")
+        history = SessionLogManager(tmp_path / "sessions").get_history("sess_one")
+        assert history[0]["recovery"] == {"source": "dag", "reason": "sse_interrupted"}
+        assert history[0]["tool_calls"] == [{
+            "id": "call_1", "tool": "health_check", "payload": "{}", "source": "dag",
+            "result": '{"ok":true}', "result_title": None, "finished": True,
+        }]
+
+    asyncio.run(run())

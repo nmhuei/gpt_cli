@@ -57,11 +57,13 @@ def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> s
         clean_prompt = p
 
     # Keep the compact CLI form, but ask the connector to bind by its workspace
-    # label.  ``host_workspace_bind`` does not accept an arbitrary local path.
-    solve_path = re.fullmatch(r"solve\s+(/\S+)", clean_prompt)
-    if target_bridge == "br" and solve_path:
-        challenge_path = solve_path.group(1)
+    solve_match = re.match(r"^solve\s+(/\S+)(?:\s+(.*))?$", clean_prompt, re.DOTALL)
+    if target_bridge == "br" and solve_match:
+        challenge_path = solve_match.group(1)
+        extra_prompt = (solve_match.group(2) or "").strip()
         workspace_name = challenge_path.rstrip("/").rsplit("/", 1)[-1]
-        return f"@br bind {workspace_name}; solve {challenge_path}"
+        bind_prefix = f"@br bind {workspace_name}; solve {challenge_path}"
+        return f"{bind_prefix} {extra_prompt}" if extra_prompt else bind_prefix
 
     return f"@{target_bridge}" + (f" {clean_prompt}" if clean_prompt else "")
+

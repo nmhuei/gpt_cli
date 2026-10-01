@@ -63,3 +63,7 @@ DEFAULT_EFFORT = "extended"
 DEFAULT_BRIDGE_NAME: str | None = None
 DEFAULT_MCP_PERMISSION = "read_only"
 DEFAULT_MCP_TUNNEL_FILE = default_mcp_tunnel_file()
+
+# Server-Side DAG Recovery Settings
+DEFAULT_RECOVERY_POLL_ATTEMPTS = 10
+DEFAULT_RECOVERY_POLL_INTERVAL = 2.0

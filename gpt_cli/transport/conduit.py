@@ -87,6 +87,7 @@ class ConduitHandshake:
         conversation_id: str | None = None,
         parent_id: str | None = None,
         system_hints: list[str] | None = None,
+        thinking_effort: str | None = None,
     ) -> tuple[dict[str, str], str, str, str | None]:
         ua = user_agent or defaults.DEFAULT_USER_AGENT
         turn_session_id = str(uuid.uuid4())
@@ -186,6 +187,8 @@ class ConduitHandshake:
             prep_body["conversation_id"] = conversation_id
         else:
             prep_body["parent_message_id"] = "client-created-root"
+        if thinking_effort:
+            prep_body["thinking_effort"] = thinking_effort
 
         prep_resp = await session.post(
             defaults.FCONV_PREPARE_URL,

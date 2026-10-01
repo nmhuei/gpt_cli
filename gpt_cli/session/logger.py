@@ -26,6 +26,7 @@ class SessionLogManager:
         message_id: str | None = None,
         thinking: list[str] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        recovery: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
         s_dir = self.session_dir(local_id)
@@ -43,6 +44,7 @@ class SessionLogManager:
             "message_id": message_id,
             "thinking": thinking or [],
             "tool_calls": tool_calls or [],
+            "recovery": recovery,
             "error": error,
         }
 
@@ -126,11 +128,19 @@ class SessionLogManager:
                     lines.append(f"  • {th}")
                 lines.append("")
 
+            recovery = h.get("recovery")
+            if isinstance(recovery, dict):
+                lines.append(f"RECOVERY: {recovery.get('reason', 'server timeline recovered')}")
+                lines.append("")
+
             tool_calls = h.get("tool_calls")
             if tool_calls:
                 lines.append("TOOL CALLS:")
                 for tc in tool_calls:
-                    lines.append(f"  ⚡ {tc.get('tool')}: {tc.get('payload')}")
+                    source = f" [{tc['source']}]" if tc.get("source") else ""
+                    result = tc.get("result")
+                    suffix = "" if result is None else f" → {str(result)[:240]}"
+                    lines.append(f"  ⚡ {tc.get('tool')}{source}: {tc.get('payload')}{suffix}")
                 lines.append("")
 
             lines.append(f"RESPONSE:\n  {h.get('response', '').strip()}")

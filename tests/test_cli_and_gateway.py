@@ -123,6 +123,36 @@ def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, t
     assert output["status"] == "terminal"
 
 
+def test_cli_json_is_one_document_when_telemetry_arrives(monkeypatch, tmp_path, capsys):
+    """Progress belongs to events.jsonl; JSON stdout must remain parseable."""
+    import asyncio
+    import json
+    from gpt_cli.cli.main import handle_run
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.telemetry.events import TelemetryEvent
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    async def fake_send_turn(self, *args, on_event=None, **kwargs):
+        assert on_event is not None
+        on_event(TelemetryEvent("recovery_started", {"source": "dag", "reason": "sse_interrupted"}))
+        on_event(TelemetryEvent("tool_call_started", {"id": "tool_1", "tool": "health_check", "payload": "{}", "source": "dag"}))
+        on_event(TelemetryEvent("tool_call_finished", {"id": "tool_1", "tool": "health_check", "output": "ok", "source": "dag"}))
+        on_event(TelemetryEvent("thinking", {"thoughts": [{"summary": "Checking health"}], "source": "dag"}))
+        return TurnResult(text="healthy", conversation_id="conv_1", message_id="msg_1", model="gpt-5-6-thinking")
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args(["run", "--json", "status"])
+    asyncio.run(handle_run(args))
+
+    rendered = capsys.readouterr().out
+    assert len(rendered.splitlines()) == 1
+    assert json.loads(rendered)["text"] == "healthy"
+
+
 def test_cli_explicit_bridge_selects_registered_mcp_connector(monkeypatch, tmp_path):
     import asyncio
     from gpt_cli.cli.main import handle_run

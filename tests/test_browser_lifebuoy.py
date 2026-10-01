@@ -10,16 +10,14 @@ def test_lifebuoy_triggers_refresh(tmp_path: Path):
         cache_mgr = TokenCacheManager(tmp_path)
         lifebuoy = BrowserLifebuoy(cache_mgr)
 
-        mock_p = AsyncMock()
         mock_context = AsyncMock()
         mock_page = AsyncMock()
         mock_context.pages = [mock_page]
-        mock_p.chromium.launch_persistent_context = AsyncMock(return_value=mock_context)
-        mock_cm = MagicMock()
-        mock_cm.__aenter__ = AsyncMock(return_value=mock_p)
-        mock_cm.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("playwright.async_api.async_playwright", return_value=mock_cm):
+        mock_cloak = MagicMock()
+        mock_cloak.launch_persistent_context_async = AsyncMock(return_value=mock_context)
+
+        with patch.dict("sys.modules", {"cloakbrowser": mock_cloak}):
             with patch.object(lifebuoy, "_extract_from_page", new_callable=AsyncMock) as mock_extract:
                 mock_extract.return_value = {
                     "accessToken": "new_refreshed_token_xyz",

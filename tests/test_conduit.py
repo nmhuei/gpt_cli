@@ -80,3 +80,28 @@ def test_prepare_turn_finalizes_prepare_token_before_conduit_prepare():
         assert "openai-sentinel-chat-requirements-token" in headers
 
     asyncio.run(run())
+
+
+def test_prepare_turn_passes_thinking_effort_to_conduit_prepare():
+    async def run():
+        calls = []
+
+        async def post(url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/sentinel/chat-requirements/prepare"):
+                return _Response(200, {"token": "requirements"})
+            if url.endswith("/f/conversation/prepare"):
+                return _Response(200, {"conduit_token": "conduit"})
+            raise AssertionError(f"unexpected endpoint: {url}")
+
+        session = AsyncMock()
+        session.post = post
+        bundle = TokenBundle(access_token="token", oai_device_id="device")
+        with patch("gpt_cli.transport.conduit.bootstrap_proof_token", return_value="bootstrap"):
+            headers, *_ = await ConduitHandshake.prepare_turn(
+                session, bundle, "gpt-5-6-thinking", thinking_effort="extended"
+            )
+
+        assert calls[1][1]["json"]["thinking_effort"] == "extended"
+
+    asyncio.run(run())

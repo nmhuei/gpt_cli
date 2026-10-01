@@ -132,6 +132,44 @@ def test_conversation_recovery_rejects_a_later_user_turn_in_the_same_dag():
 
     asyncio.run(_run())
 
+
+def test_conversation_recovery_backfills_exposed_tool_and_reasoning_timeline():
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        session = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "current_node": "final",
+            "mapping": {
+                "user": {"parent": "client-created-root", "message": {"author": {"role": "user"}, "content": {"content_type": "text"}}},
+                "discover": {"parent": "user", "message": {"id": "discover", "author": {"role": "assistant"}, "recipient": "api_tool.list_resources", "content": {"content_type": "code", "parts": ['{"paths":["br"],"query":"health"}']}}},
+                "discover_result": {"parent": "discover", "message": {"id": "discover_result", "author": {"role": "tool", "name": "api_tool"}, "content": {"content_type": "text", "parts": ["listed"]}}},
+                "health": {"parent": "discover_result", "message": {"id": "health", "author": {"role": "assistant"}, "recipient": "api_tool.call_tool", "content": {"content_type": "code", "parts": ['{"path":"/br/link/health_check","args":{}}']}}},
+                "health_result": {"parent": "health", "message": {"id": "health_result", "author": {"role": "tool", "name": "api_tool.call_tool"}, "content": {"content_type": "text", "parts": ['{"ok":true}']}}},
+                "thought": {"parent": "health_result", "message": {"id": "thought", "author": {"role": "assistant"}, "recipient": "all", "content": {"content_type": "thoughts", "thoughts": [{"summary": "Health confirmed"}]}}},
+                "recap": {"parent": "thought", "message": {"id": "recap", "author": {"role": "assistant"}, "recipient": "all", "content": {"content_type": "reasoning_recap", "content": "Worked for 2s"}}},
+                "final": {"parent": "recap", "message": {"id": "final", "author": {"role": "assistant"}, "recipient": "all", "content": {"content_type": "text", "parts": ["healthy"]}, "status": "finished_successfully", "metadata": {"finish_details": {"type": "stop"}}}},
+            },
+        }
+        session.get = AsyncMock(return_value=response)
+
+        state = await ConversationRecovery(bundle, session=session).fetch(
+            "conv_123", expected_user_message_id="user"
+        )
+
+        assert [(event.event_type, event.data["source"]) for event in state.timeline] == [
+            ("tool_call_started", "dag"),
+            ("tool_call_finished", "dag"),
+            ("tool_call_started", "dag"),
+            ("tool_call_finished", "dag"),
+            ("thinking", "dag"),
+            ("reasoning_recap", "dag"),
+        ]
+        assert state.timeline[2].data["tool"] == "health_check"
+        assert state.timeline[3].data["output"] == '{"ok":true}'
+
+    asyncio.run(_run())
+
 def test_wire_payload_construction():
     bundle = TokenBundle(access_token="fake", oai_device_id="dev")
     transport = WireTransport(bundle)
@@ -190,6 +228,7 @@ def test_wire_turn_passes_connector_hint_to_prepare_and_conversation():
             await transport._send_once("@br bind Chrono_II; solve", system_hints=["connector_br"])
 
         assert prepare.call_args.kwargs["system_hints"] == ["connector_br"]
+        assert prepare.call_args.kwargs["thinking_effort"] == "extended"
         assert transport.session.post.call_args.kwargs["json"]["system_hints"] == ["connector_br"]
 
     asyncio.run(_run())
@@ -364,6 +403,102 @@ def test_wire_recovers_completed_text_from_dag_after_sse_error():
         assert result.text == "Recovered server answer"
         assert result.message_id == "assistant_final"
         assert result.error is None
+
+    asyncio.run(_run())
+
+
+def test_wire_polls_dag_until_settled_on_sse_error():
+    """Verify that when SSE drops mid-turn while BE is in_progress, polling settles and recovers the final answer."""
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        transport = WireTransport(bundle)
+
+        class MockResponse:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_recovered","error":"unusual activity"}\n\n'
+
+        state_in_progress = SimpleNamespace(
+            role="assistant",
+            recipient="all",
+            content_type="text",
+            message_status="in_progress",
+            finish_type=None,
+            node_id="assistant_running",
+            text="Thinking...",
+            matches_expected_message=True,
+        )
+        state_finished = SimpleNamespace(
+            role="assistant",
+            recipient="all",
+            content_type="text",
+            message_status="finished_successfully",
+            finish_type="stop",
+            node_id="assistant_final",
+            text="Completed answer after polling DAG",
+            matches_expected_message=True,
+        )
+
+        mock_fetch = AsyncMock(side_effect=[state_in_progress, state_finished])
+
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as mock_prep:
+            mock_prep.return_value = ({}, "s1", "t1", None)
+            with patch.object(transport.session, "post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = MockResponse()
+                with patch(
+                    "gpt_cli.transport.conversation.ConversationRecovery.fetch",
+                    mock_fetch,
+                ):
+                    with patch("gpt_cli.config.defaults.DEFAULT_RECOVERY_POLL_INTERVAL", 0.001):
+                        result = await transport._send_once(prompt="hello")
+
+        assert mock_fetch.call_count == 2
+        assert result.status == "completed"
+        assert result.lifecycle_status == "completed_turn"
+        assert result.text == "Completed answer after polling DAG"
+        assert result.message_id == "assistant_final"
+        assert result.error is None
+
+    asyncio.run(_run())
+
+
+def test_wire_backfills_only_missing_dag_timeline_events_after_sse_error():
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+
+        class MockResponse:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_recovered","message":{"id":"tool_live","author":{"role":"assistant"},"recipient":"api_tool.call_tool","content":{"content_type":"code","parts":["{}"]}}}\n\n'
+                yield b'data: {"error":"unusual activity"}\n\n'
+
+        recovered = SimpleNamespace(
+            role="assistant", recipient="all", content_type="text",
+            message_status="finished_successfully", finish_type="stop",
+            node_id="assistant_final", text="Recovered answer",
+            matches_expected_message=True,
+            timeline=(
+                TelemetryEvent("tool_call_started", {"id": "tool_live", "tool": "health_check", "payload": "{}", "source": "dag"}),
+                TelemetryEvent("tool_call_finished", {"id": "tool_live", "tool": "health_check", "output": '{"ok":true}', "source": "dag"}),
+                TelemetryEvent("thinking", {"thoughts": [{"summary": "Health confirmed"}], "source": "dag"}),
+            ),
+        )
+        events = []
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as prepare:
+            prepare.return_value = ({}, "s1", "t1", None)
+            transport.session.post = AsyncMock(return_value=MockResponse())
+            with patch("gpt_cli.transport.conversation.ConversationRecovery.fetch", new_callable=AsyncMock, return_value=recovered):
+                result = await transport._send_once("hello", on_event=events.append)
+
+        assert result.lifecycle_status == "completed_turn"
+        assert [(event.event_type, event.data.get("id")) for event in events if event.event_type.startswith("tool_call")] == [
+            ("tool_call_started", "tool_live"),
+            ("tool_call_finished", "tool_live"),
+        ]
+        assert any(event.event_type == "recovery_started" for event in events)
+        assert any(event.event_type == "thinking" and event.data.get("source") == "dag" for event in events)
 
     asyncio.run(_run())
 

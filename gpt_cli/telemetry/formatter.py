@@ -60,6 +60,29 @@ def format_tool_call(tool_name: str, raw_payload: Any) -> tuple[str, str]:
     return title, f"```json\n{_render(payload)}\n```"
 
 
+def extract_tool_command_summary(tool_name: str, raw_payload: Any) -> str:
+    """Extract a concise single-line description of the tool execution."""
+    payload = _unwrap_payload(raw_payload)
+    cmd = (
+        payload.get("command")
+        or payload.get("cmd")
+        or payload.get("command_line")
+        or payload.get("CommandLine")
+        or payload.get("query")
+        or payload.get("path")
+        or payload.get("paths")
+        or payload.get("code")
+    )
+    if cmd:
+        cmd_str = str(cmd).replace("\n", " ").strip()
+        return f"{tool_name}: {cmd_str}"
+    if payload:
+        first_val = next(iter(payload.values()))
+        if isinstance(first_val, (str, int, float)):
+            return f"{tool_name}: {first_val}"
+    return tool_name
+
+
 def format_tool_output(tool_name: str, raw_output: Any, title: str | None = None) -> str:
     """Render output through common result fields, without inspecting names."""
     del tool_name, title

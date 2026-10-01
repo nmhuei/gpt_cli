@@ -49,8 +49,13 @@ class WireTransport:
             "author": {"role": "user"},
             "content": {"content_type": "text", "parts": [prompt]},
         }
+        metadata: dict[str, Any] = {}
         if selected_mcp_sources:
-            message["metadata"] = {"selected_mcp_sources": list(selected_mcp_sources)}
+            metadata["selected_mcp_sources"] = list(selected_mcp_sources)
+        if model_def.supports_thinking:
+            metadata["thinking_effort"] = chosen_effort
+        if metadata:
+            message["metadata"] = metadata
         payload: dict[str, Any] = {
             "action": "next",
             "messages": [message],
@@ -130,6 +135,11 @@ class WireTransport:
         model_def = ModelRegistry.resolve(model_alias)
         t0 = time.perf_counter()
 
+        chosen_effort = effort or model_def.default_effort
+        if chosen_effort not in ("extended", "standard"):
+            chosen_effort = "standard" if chosen_effort in ("low", "none", "off", "min", "medium") else "extended"
+        thinking_effort = chosen_effort if model_def.supports_thinking else None
+
         # Step 1: Conduit Handshake
         headers, s_id, t_id, conduit = await ConduitHandshake.prepare_turn(
             self.session,
@@ -139,6 +149,7 @@ class WireTransport:
             conversation_id=conversation_id,
             parent_id=parent_id,
             system_hints=system_hints,
+            thinking_effort=thinking_effort,
         )
         self.latest_turn_headers = dict(headers)
         self.latest_turn_trace_id = t_id
@@ -235,6 +246,44 @@ class WireTransport:
             if completion_seen and not pending_tool_ids and not anonymous_tool_calls:
                 is_done = True
 
+        def event_identity(ev: Any) -> tuple[object, ...] | None:
+            """Return a stable identity for de-duplicating recovered telemetry.
+
+            The upstream stream and the later DAG snapshot use the same message id
+            for tool calls.  Textual reasoning items do not reliably carry an id,
+            so they deliberately remain visible when recovered rather than risk
+            suppressing a distinct server-exposed recap.
+            """
+            data = getattr(ev, "data", None)
+            if not isinstance(data, dict):
+                return None
+            event_id = data.get("id")
+            if isinstance(event_id, str) and event_id:
+                return (getattr(ev, "event_type", None), event_id)
+            return None
+
+        def emit_recovered_timeline(timeline: object) -> None:
+            """Backfill server-exposed events absent from an interrupted SSE feed."""
+            if not isinstance(timeline, tuple) or not timeline:
+                return
+            from ..telemetry.events import TelemetryEvent
+
+            seen = {
+                identity for event in observed_events
+                if (identity := event_identity(event)) is not None
+            }
+            consume_event(TelemetryEvent("recovery_started", {
+                "source": "dag",
+                "reason": "sse_interrupted",
+            }))
+            for event in timeline:
+                identity = event_identity(event)
+                if identity is not None and identity in seen:
+                    continue
+                consume_event(event)
+                if identity is not None:
+                    seen.add(identity)
+
         try:
             async for chunk in response.aiter_content():
                 events = parser.feed(chunk)
@@ -257,12 +306,13 @@ class WireTransport:
                 self.bundle, session=self.session, user_agent=self.user_agent
             )
             try:
-                dag_state = await recovery.fetch(
+                # Poll DAG until settled on the backend (inference worker may still be generating)
+                dag_state = await recovery.fetch_settled(
                     captured_conv_id,
                     expected_user_message_id=request_message_id,
                 )
                 recovered_completed_answer = (
-                    stream_err is not None
+                    (stream_err is not None or not is_done)
                     and dag_state.matches_expected_message is True
                     and dag_state.role == "assistant"
                     and dag_state.recipient in (None, "", "all", "final")
@@ -272,6 +322,7 @@ class WireTransport:
                     and bool(dag_state.node_id)
                 )
                 if recovered_completed_answer:
+                    emit_recovered_timeline(getattr(dag_state, "timeline", ()))
                     full_text = [dag_state.text]
                     last_msg_id = dag_state.node_id
                     stream_err = None
