@@ -110,6 +110,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--json", action="store_true", help="Output JSON")
     return parser
 
+
+def parse_cli_args(argv: list[str]) -> argparse.Namespace:
+    """Parse commands, including the compact fresh-turn bridge shortcut.
+
+    ``gpt -b br -p 'solve /absolute/path'`` is intentionally equivalent to
+    ``gpt run -b br -p 'solve /absolute/path'``.  It always creates a fresh
+    local session unless an explicit resume flag is supplied.
+    """
+    parser = build_cli_parser()
+    run_shortcut_options = {"-b", "--bridge", "-p", "--prompt", "--no-bridge", "--json"}
+    if argv and argv[0] in run_shortcut_options:
+        return parser.parse_args(["run", *argv])
+    return parser.parse_args(argv)
+
 from ..core.bridge import resolve_prompt_with_bridge
 
 
@@ -693,7 +707,7 @@ def main() -> None:
         return
 
     parser = build_cli_parser()
-    args = parser.parse_args()
+    args = parse_cli_args(sys.argv[1:])
     if not args.command:
         parser.print_help()
         sys.exit(0)

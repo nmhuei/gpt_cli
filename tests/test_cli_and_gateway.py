@@ -3,7 +3,7 @@ from starlette.testclient import TestClient
 from pathlib import Path
 from gpt_cli.server.app import create_app
 from gpt_cli.session.registry import SessionRegistry
-from gpt_cli.cli.main import build_cli_parser
+from gpt_cli.cli.main import build_cli_parser, parse_cli_args
 
 def test_gateway_health():
     app = create_app()
@@ -36,6 +36,15 @@ def test_cli_parser_run_command():
     assert args.prompt == "Test prompt"
     assert args.json is True
     assert args.resume_session == "sess_custom"
+
+
+def test_cli_parser_accepts_bridge_prompt_shortcut_without_run_command():
+    args = parse_cli_args(["-b", "br", "-p", "solve /tmp/challenge"])
+
+    assert args.command == "run"
+    assert args.bridge == "br"
+    assert args.prompt == "solve /tmp/challenge"
+    assert args.resume is False
 
 
 def test_cli_parser_makes_new_and_resume_contract_unambiguous():

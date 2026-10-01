@@ -36,4 +36,11 @@ def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> s
             return p
         clean_prompt = p
 
+    # The host MCP needs an explicit workspace bind before it can access an
+    # absolute challenge directory.  Preserve the compact CLI form
+    # ``gpt -b br -p 'solve /absolute/path'`` while emitting that native bind.
+    solve_path = re.fullmatch(r"solve\s+(/\S+)", clean_prompt)
+    if target_bridge == "br" and solve_path:
+        return f"@br host_workspace_bind path={solve_path.group(1)}; solve"
+
     return f"@{target_bridge}" + (f" {clean_prompt}" if clean_prompt else "")
