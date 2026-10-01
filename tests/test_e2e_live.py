@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import pytest
 from gpt_cli.core.token_cache import TokenCacheManager
@@ -14,6 +15,10 @@ TEST_PROMPTS = [
 ]
 
 @pytest.mark.live
+@pytest.mark.skipif(
+    os.getenv("WEBGPT_RUN_LIVE_TESTS") != "1",
+    reason="live upstream certification requires WEBGPT_RUN_LIVE_TESTS=1",
+)
 def test_live_5_concurrent_workers_certification():
     async def _run():
         cache_mgr = TokenCacheManager("~/.local/share/webgpt/profiles/personal")

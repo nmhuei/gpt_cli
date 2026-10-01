@@ -122,6 +122,29 @@ before the owner-scoped live record is released.  An explicit safe resume
 restores and drains them after its first completed turn; it never sends them
 onto an upstream turn that is still active.
 
+### INC-004 — parallel controllers continued after an upstream anti-abuse response
+
+**Observed:** Independent sessions sent many short `continue` turns in a
+burst. The upstream first emitted SSE `unusual activity`, then later returned
+HTTP 429. A new unrelated prompt therefore failed even though cached
+credentials were present and its JWT was unexpired.
+
+**Root cause:** retries were scoped to one `WireTransport` process. There was
+no shared admission state, so a server rejection in one session did not stop
+other local processes from creating more traffic.
+
+**Fix:** the transport now serializes turn starts through a file-locked runtime
+admission record. Starts are separated by 15 seconds by default; an SSE
+`unusual activity` or HTTP 429-style response opens a shared 15-minute
+cooldown. During that interval the CLI returns `upstream_error` with the retry
+timestamp and makes no upstream POST. The interval and cooldown are
+configurable through `WEBGPT_REQUEST_INTERVAL_SECONDS` and
+`WEBGPT_REJECTION_COOLDOWN_SECONDS`.
+
+**Test policy:** live upstream certification is opt-in via
+`WEBGPT_RUN_LIVE_TESTS=1`; normal unit tests never read the real runtime
+admission file or send test traffic.
+
 ## Operating invariants
 
 1. A new prompt starts a new conversation by default.  Resuming requires
@@ -137,6 +160,9 @@ onto an upstream turn that is still active.
    never as ordinary quota exhaustion.
 5. Do not auto-submit flags.  Keep validated candidates and their evidence;
    submission remains an explicit user action.
+6. Treat SSE `unusual activity` and HTTP 429 as a shared upstream admission
+   failure. Stop all new turns until the recorded cooldown expires; do not
+   convert it into an auth/browser-refresh attempt.
 
 ## Remaining autonomy gap
 

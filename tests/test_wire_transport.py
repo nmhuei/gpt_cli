@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gpt_cli.core.types import SteerContext, TokenBundle, TurnResult
 from gpt_cli.models.registry import ModelRegistry
 from gpt_cli.transport.wire import WireTransport
+from gpt_cli.transport.admission import UpstreamAdmission
 from gpt_cli.transport.conduit import ConduitHandshake
 from gpt_cli.transport.conversation import ConversationRecovery, ConversationState
 from gpt_cli.transport.lifecycle import LifecycleStatus, classify_lifecycle
@@ -300,10 +301,10 @@ def test_wire_http_error_text_property_extraction():
 
     asyncio.run(_run())
 
-def test_wire_send_turn_retries_and_recovers_on_transient_error():
+def test_wire_send_turn_retries_and_recovers_on_transient_error(tmp_path):
     async def _run():
         bundle = TokenBundle(access_token="fake", oai_device_id="dev")
-        transport = WireTransport(bundle)
+        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0))
 
         mock_send = AsyncMock()
         mock_send.side_effect = [
@@ -320,10 +321,10 @@ def test_wire_send_turn_retries_and_recovers_on_transient_error():
     asyncio.run(_run())
 
 
-def test_wire_never_replays_prompt_after_a_tool_has_started():
+def test_wire_never_replays_prompt_after_a_tool_has_started(tmp_path):
     async def _run():
         bundle = TokenBundle(access_token="fake", oai_device_id="dev")
-        transport = WireTransport(bundle)
+        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0))
 
         async def tool_then_disconnect(**kwargs):
             kwargs["on_event"](TelemetryEvent(event_type="tool_call_started", data={"id": "call-1"}))
@@ -336,7 +337,7 @@ def test_wire_never_replays_prompt_after_a_tool_has_started():
 
     asyncio.run(_run())
 
-def test_wire_send_turn_triggers_lifebuoy_on_401():
+def test_wire_send_turn_triggers_lifebuoy_on_401(tmp_path):
     async def _run():
         import base64
         import json
@@ -344,7 +345,7 @@ def test_wire_send_turn_triggers_lifebuoy_on_401():
         expired_payload = base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) - 3600}).encode()).decode().rstrip("=")
         expired_token = f"eyJhbGciOiJIUzI1NiJ9.{expired_payload}.signature"
         bundle = TokenBundle(access_token=expired_token, oai_device_id="dev")
-        transport = WireTransport(bundle)
+        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0))
 
         mock_send = AsyncMock()
         mock_send.side_effect = [

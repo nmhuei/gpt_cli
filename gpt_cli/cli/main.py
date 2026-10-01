@@ -554,12 +554,15 @@ async def handle_run(args: argparse.Namespace) -> None:
             "bqa_workspace_path": sess.bqa_workspace_path,
             "model": result.model,
             "duration_ms": result.duration_ms,
+            "error": result.error,
             "log_dir": str(log_mgr.session_dir(sess.local_id))
         }
         print(json.dumps(out, ensure_ascii=False))
     else:
         if lifecycle_status != "completed_turn":
             sys.stdout.write(f"\n\033[33m⚠️ [Turn Lifecycle: {lifecycle_status}]\033[0m\n")
+            if result.error:
+                sys.stdout.write(f"\033[2mReason: {result.error}\033[0m\n")
             sys.stdout.write("\033[2mConversation pointer has been checkpointed for inspection or an explicit later resume.\033[0m\n\n")
             sys.stdout.flush()
         else:

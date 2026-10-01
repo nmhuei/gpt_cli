@@ -10,14 +10,21 @@ from ..config import defaults
 from ..config.settings import Settings
 from ..models.registry import ModelRegistry
 from .conduit import ConduitHandshake
+from .admission import UpstreamAdmission, UpstreamCooldownError, is_upstream_rejection
 
 class WireTransport:
     """High-performance Wire Conduit transport (0 MB browser RAM) via curl_cffi."""
     
-    def __init__(self, bundle: TokenBundle, user_agent: str | None = None):
+    def __init__(
+        self,
+        bundle: TokenBundle,
+        user_agent: str | None = None,
+        admission: UpstreamAdmission | None = None,
+    ):
         self.bundle = bundle
         self.user_agent = user_agent or defaults.DEFAULT_USER_AGENT
         self.session = AsyncSession(impersonate="chrome146")
+        self.admission = admission or UpstreamAdmission()
         self.latest_turn_headers: dict[str, str] = {}
         self.latest_turn_trace_id: str | None = None
 
@@ -303,6 +310,21 @@ class WireTransport:
     ) -> TurnResult:
         last_err: Exception | None = None
         for attempt in range(max_retries):
+            try:
+                delay = self.admission.reserve()
+            except UpstreamCooldownError as exc:
+                return TurnResult(
+                    text="",
+                    conversation_id=conversation_id or "",
+                    message_id=parent_id or "",
+                    model=ModelRegistry.resolve(model_alias).slug,
+                    duration_ms=0,
+                    status="failed",
+                    error=str(exc),
+                    lifecycle_status="upstream_error",
+                )
+            if delay:
+                await asyncio.sleep(delay)
             tool_dispatched = False
 
             def observe_event(event: Any) -> None:
@@ -324,6 +346,8 @@ class WireTransport:
                     selected_mcp_sources=selected_mcp_sources,
                     on_event=observe_event,
                 )
+                if is_upstream_rejection(res.error):
+                    self.admission.record_rejection(res.error)
                 # If incomplete, stream has already delivered partial progress; do not auto-replay prompt
                 return res
             except Exception as e:
@@ -333,6 +357,9 @@ class WireTransport:
                 if tool_dispatched:
                     raise
                 err_msg = str(e)
+                if is_upstream_rejection(err_msg):
+                    self.admission.record_rejection(err_msg)
+                    raise
                 # Interruption 1: 401 Unauthorized / 403 Forbidden (Token expired / auth failure)
                 if any(x in err_msg for x in ("HTTP 401", "HTTP 403", "token_expired")):
                     from ..core.token_cache import TokenCacheManager
