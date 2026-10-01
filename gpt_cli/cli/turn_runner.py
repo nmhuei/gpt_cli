@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,12 @@ class SessionTurnRunner:
                 initial = await self._execute_turn(prompt)
                 if initial.status not in {"completed", "terminal"}:
                     return initial
+                for pending_prompt in self.registry.take_pending_steers(self.session.local_id):
+                    self.live_registry.enqueue(
+                        self.session.local_id,
+                        request_id=uuid.uuid4().hex,
+                        prompt=pending_prompt,
+                    )
                 while True:
                     queued = self.live_registry.claim_next_queued(self.session.local_id)
                     if queued is None:

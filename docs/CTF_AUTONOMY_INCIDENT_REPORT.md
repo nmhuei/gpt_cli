@@ -117,10 +117,10 @@ parent were recorded.
 session registry has already checkpointed its new parent message and bound BQA
 workspace, so this creates no new conversation.
 
-**Required fix:** persist unconsumed queued instructions outside the
-owner-scoped live record before release, and drain them only after lifecycle
-recovery says the upstream turn is safe to continue.  Do not blindly send them
-on an active server turn.
+**Fix:** `628d16e` persists unconsumed instructions on the local session
+before the owner-scoped live record is released.  An explicit safe resume
+restores and drains them after its first completed turn; it never sends them
+onto an upstream turn that is still active.
 
 ## Operating invariants
 

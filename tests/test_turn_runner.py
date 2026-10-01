@@ -142,6 +142,38 @@ def test_runner_preserves_unconsumed_steers_after_incomplete_turn(tmp_path: Path
     asyncio.run(run())
 
 
+def test_runner_drains_preserved_steers_after_explicit_resume(tmp_path: Path):
+    """A safe explicit resume replays instructions saved by the previous owner."""
+    async def run() -> None:
+        release = asyncio.Event()
+        first_fake = FakeWireTransport(release, result_statuses=["completed", "incomplete"])
+        first_runner, registry = _runner(tmp_path, first_fake)
+        initial = asyncio.create_task(first_runner.run_initial("initial"))
+        await first_fake.initial_started.wait()
+        await first_runner.request_steer("r1", "first")
+        await first_runner.request_steer("r2", "second")
+        release.set()
+        await initial
+
+        resumed_fake = FakeWireTransport(release)
+        resumed_runner = SessionTurnRunner(
+            registry=registry,
+            live_registry=LiveTurnRegistry(tmp_path / "runtime"),
+            log_manager=SessionLogManager(tmp_path / "sessions"),
+            token_bundle=TokenBundle(access_token="fake"),
+            session=registry.require_session("sess_one"),
+            model="gpt-5-6-thinking",
+            effort="extended",
+            transport_factory=lambda _: resumed_fake,
+        )
+        await resumed_runner.run_initial("resume")
+
+        assert [call[0] for call in resumed_fake.calls] == ["resume", "first", "second"]
+        assert registry.require_session("sess_one").pending_steers == []
+
+    asyncio.run(run())
+
+
 def test_runner_persists_bound_bqa_workspace_from_tool_result(tmp_path: Path):
     async def run() -> None:
         release = asyncio.Event()

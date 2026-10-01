@@ -260,6 +260,23 @@ class SessionRegistry:
             self._save()
             return SessionRecord(**session)
 
+    def take_pending_steers(self, local_id: str) -> list[str]:
+        """Atomically hand persisted instructions back to a newly safe live owner."""
+        with self._lock():
+            self._load()
+            session = self._data.get("sessions", {}).get(local_id)
+            if session is None:
+                return []
+            pending = session.get("pending_steers", [])
+            if not isinstance(pending, list):
+                pending = []
+            prompts = [prompt for prompt in pending if isinstance(prompt, str) and prompt.strip()]
+            session["pending_steers"] = []
+            if prompts:
+                session["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._save()
+            return prompts
+
     def list_sessions(self) -> list[SessionRecord]:
         with self._lock():
             self._load()
