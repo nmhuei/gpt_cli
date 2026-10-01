@@ -37,13 +37,13 @@ Make every prompt independent by default, make continuation explicit and safe, a
 | `gpt` | Open interactive chat on a fresh local session. |
 | `gpt chat` | Open interactive chat on a fresh local session. |
 | `gpt run --resume PROMPT` | Continue the current local active session. |
-| `gpt run --resume SESSION_ID PROMPT` | Continue exactly `SESSION_ID`. |
-| `gpt chat --resume [SESSION_ID]` | Open an interactive continuation of the active or named local session. |
+| `gpt run --resume-session SESSION_ID PROMPT` | Continue exactly `SESSION_ID`. |
+| `gpt chat --resume` / `gpt chat --resume-session SESSION_ID` | Open an interactive continuation of the active or named local session. |
 | `gpt run --conversation UUID PROMPT` / `gpt chat --conversation UUID` | Attach a newly-created local session to the named ChatGPT Web conversation before running or chatting. |
 
-`--resume` with no identifier requires an active local session. `--resume SESSION_ID` requires that local session to exist. Both errors are explicit and use a nonzero exit status; neither may silently create a session. A prompt path without `--resume` must not read or mutate the active session pointer before creating its own session.
+`--resume` requires an active local session. `--resume-session SESSION_ID` requires that local session to exist. The separate named flag intentionally avoids argparse interpreting a one-word positional prompt as an optional session ID. Both errors are explicit and use a nonzero exit status; neither may silently create a session. A prompt path without either resume flag must not read or mutate the active session pointer before creating its own session.
 
-`--resume` and `--conversation` are mutually exclusive. `--conversation` is deliberately named differently from `--resume`: one selects an existing local session; the other imports an upstream ChatGPT Web DAG pointer into a new local session.
+`--resume`, `--resume-session`, and `--conversation` are mutually exclusive. `--conversation` is deliberately named differently from the resume flags: one imports an upstream ChatGPT Web DAG pointer into a new local session; the others select a local session.
 
 ### Session administration
 
@@ -53,10 +53,10 @@ Make every prompt independent by default, make continuation explicit and safe, a
 
 ```text
 gpt steer "new instruction"
-gpt steer --resume SESSION_ID "new instruction"
+gpt steer --resume-session SESSION_ID "new instruction"
 ```
 
-Without a session ID, `steer` targets exactly one currently live local turn. It errors when there are none or more than one. With `--resume SESSION_ID`, it targets that live turn only.
+Without a session ID, `steer` targets exactly one currently live local turn. It errors when there are none or more than one. With `--resume-session SESSION_ID`, it targets that live turn only. `gpt steer --resume "instruction"` targets the active local session and still requires it to be live.
 
 The response status is one of:
 
@@ -112,7 +112,7 @@ The live record contains the lease and queued prompt entries. Queue entries carr
 
 ## 7. Error handling
 
-- A nonexistent `--resume ID` is an input error, not session creation.
+- A nonexistent `--resume-session ID` is an input error, not session creation.
 - An active-session lookup with no active ID is an input error.
 - An attempted second turn on a live local session is a busy error; it does not branch the remote DAG.
 - A broken socket/PID mismatch becomes a stale-lease diagnostic after cleanup.
