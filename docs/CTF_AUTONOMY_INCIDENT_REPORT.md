@@ -1,0 +1,120 @@
+# CTF autonomy incident report
+
+Last updated: 2026-10-01
+
+This is the operational record for the `CSS_CTF_Semester_2_2026` run.  It
+separates protocol defects from normal long-running model work.  A flag-looking
+string is never a solved state; it needs local/protocol validation and then
+explicit human submission.
+
+## Active run
+
+| Field | Value |
+| --- | --- |
+| Challenge | `Chrono_II` |
+| Local GPT session | `sess_51f01bdf` |
+| Conversation | `6abdf956-0468-83ec-ae83-71942742aefa` |
+| Bound BQA workspace | `cw-20261001-Chrono_II-548a47f1` |
+| State | Turn active; one claimed and one pending `continue` request |
+| Current evidence | Connector tools execute successfully; no valid flag verified yet |
+
+## Confirmed defects fixed
+
+### INC-001 — `-b br` only produced text, not a usable MCP attachment
+
+**Observed:** The model saw `@br` in the prompt but could not call `br` tools.
+
+**Root cause:** The conversation payload carried only a textual system hint.
+The ChatGPT web protocol requires the resolved connector object in the user
+message's `metadata.selected_mcp_sources` field.
+
+**Fix:** `c5fcd01` resolves the native connector metadata through
+`PluginManager.get_connector_source()` and passes it through the CLI runner,
+Wire transport, and conversation payload.
+
+**Verification:** A live `bind Chrono_II` turn invoked
+`host_workspace_bind` successfully.  Unit coverage verifies that the full
+connector source is propagated.
+
+### INC-002 — compact `solve <path>` discarded the challenge path
+
+**Observed:** The `br` shortcut became `@br bind Chrono_II; solve`; the model
+bound the workspace but correctly asked the user to supply the challenge
+input.
+
+**Root cause:** `resolve_prompt_with_bridge()` retained only the basename to
+choose the BQA workspace, then dropped the absolute challenge path that the
+solver needs.
+
+**Fix:** `a6f70ef` keeps the compact imperative command while sending
+`@br bind <workspace>; solve <absolute-path>`.
+
+**Verification:** `tests/test_bridge_resolution.py` passes all 13 tests.
+
+## Investigated observations — not defects
+
+### OBS-001 — a long host command was mistaken for a stalled SSE turn
+
+The turn emitted `tool_call_started` for a bounded time-series collection.
+The SSE connection remained established and later emitted further tool events;
+there was no transport error, 401/403, timeout, or abandoned process.  The
+correct state is **tool-running**, not **model-waiting** and not **dead**.
+
+**Controller rule:** retain the session and DAG while a tool is pending.  Do
+not start a second `gpt run` on the same session.  `gpt steer --resume-session
+<id> -p continue` appends a durable queued turn, which runs after completion.
+
+### OBS-002 — decryption output matched the flag shape but failed validation
+
+The solver explicitly reported `verify=False` for an offset hypothesis.
+Several decoded strings happened to start with `CSSCTF{`, but they were
+inconsistent across samples.  These are rejected candidates, not flags.
+
+**Controller rule:** only record a candidate after it passes the challenge's
+reproducible solver/known-plaintext checks.  Never submit based only on a
+regular-expression match.
+
+### OBS-003 — `ctf status 3 --solver` reported an unknown challenge ID
+
+This was observed once after the solver overview displayed Chrono II as ID 3.
+It has not been reproduced or traced through the CTF command parser, so it is
+not classified as a product defect yet.  The GPT run is independent of that
+read-only status command.
+
+## Operating invariants
+
+1. A new prompt starts a new conversation by default.  Resuming requires
+   `--resume-session <local-session-id>`; `--session-id` is not a valid flag.
+2. A live session accepts a short queued instruction through `gpt steer`.
+   The queue preserves the same `conversation_id`, parent message DAG, bound
+   BQA chat, and connector context.
+3. Classify each active run using telemetry before recovery:
+   `tool-running`, `server-active`, `completed`, `terminal`,
+   `connector-unavailable`, `tool-timeout`, or `transport-lost`.
+4. Investigate 401/403 as a wire/auth invariant failure (cookies, account
+   header, Sentinel/PoW, device identity, TLS fingerprint, or JWT refresh),
+   never as ordinary quota exhaustion.
+5. Do not auto-submit flags.  Keep validated candidates and their evidence;
+   submission remains an explicit user action.
+
+## Remaining autonomy gap
+
+The current runner serializes initial and queued turns correctly, but it does
+not yet own a CTF-specific policy loop that evaluates a completed response for
+`flag verified`, `needs continue`, `tool timeout`, or `connector failure` and
+chooses the next short instruction.  That controller must use the lifecycle
+classification already produced by `WireTransport`; it must not infer a
+failure merely from elapsed wall-clock time or flag-shaped text.
+
+Before implementing that subsystem, keep this decision table as the required
+acceptance contract:
+
+| Evidence after a turn | Controller action |
+| --- | --- |
+| Validated flag and reproducible proof | Record candidate and request human submission |
+| Normal terminal response, no flag | Queue `continue` on the same session |
+| `tool-running` or `server-active` | Wait; retain session and pending steer queue |
+| `tool-timeout` | Preserve logs, queue a short recovery instruction on the same session |
+| `connector-unavailable` | Re-resolve connector metadata and retry only after attachment is confirmed |
+| `transport-lost` | Recover the upstream DAG, then resume only from the recovered parent |
+| 401/403 | Stop retries; diagnose protocol/auth invariants first |
