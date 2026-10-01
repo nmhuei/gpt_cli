@@ -38,7 +38,7 @@ def test_resolve_prompt_default_bridge_without_mention():
 
 def test_resolve_prompt_binds_workspace_name_for_br():
     res = resolve_prompt_with_bridge("solve /tmp/challenge", bridge_name="br")
-    assert res == "@br bind challenge; solve"
+    assert res == "@br bind challenge; solve /tmp/challenge"
     assert len(res.split()) <= 5
 
 def test_resolve_prompt_no_bridge_disabled():

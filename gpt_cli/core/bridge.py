@@ -60,7 +60,8 @@ def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> s
     # label.  ``host_workspace_bind`` does not accept an arbitrary local path.
     solve_path = re.fullmatch(r"solve\s+(/\S+)", clean_prompt)
     if target_bridge == "br" and solve_path:
-        workspace_name = solve_path.group(1).rstrip("/").rsplit("/", 1)[-1]
-        return f"@br bind {workspace_name}; solve"
+        challenge_path = solve_path.group(1)
+        workspace_name = challenge_path.rstrip("/").rsplit("/", 1)[-1]
+        return f"@br bind {workspace_name}; solve {challenge_path}"
 
     return f"@{target_bridge}" + (f" {clean_prompt}" if clean_prompt else "")
