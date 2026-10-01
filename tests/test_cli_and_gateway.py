@@ -123,6 +123,34 @@ def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, t
     assert output["status"] == "terminal"
 
 
+def test_cli_explicit_bridge_selects_registered_mcp_connector(monkeypatch, tmp_path):
+    import asyncio
+    from gpt_cli.cli.main import handle_run
+    from gpt_cli.core.types import TokenBundle, TurnResult
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(
+        "gpt_cli.cli.main.resolve_connector_context",
+        lambda name: (["connector_br"], [{"id": "connector_br", "name": "br"}]),
+    )
+
+    async def fake_send_turn(self, *args, **kwargs):
+        observed["system_hints"] = kwargs.get("system_hints")
+        observed["selected_mcp_sources"] = kwargs.get("selected_mcp_sources")
+        return TurnResult(text="done", conversation_id="conv_1", message_id="msg_1", model="gpt-5-6-thinking")
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args(["run", "--json", "-b", "br", "bind Chrono_II"])
+    asyncio.run(handle_run(args))
+
+    assert observed["system_hints"] == ["connector_br"]
+    assert observed["selected_mcp_sources"] == [{"id": "connector_br", "name": "br"}]
+
+
 def test_cli_named_resume_never_creates_a_missing_session(monkeypatch, tmp_path):
     """Falling back to get_or_create here would silently join unrelated work."""
     import asyncio

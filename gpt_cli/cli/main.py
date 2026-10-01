@@ -125,7 +125,7 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
         return parser.parse_args(["run", *argv])
     return parser.parse_args(argv)
 
-from ..core.bridge import resolve_prompt_with_bridge
+from ..core.bridge import resolve_connector_context, resolve_prompt_with_bridge
 
 
 async def interactive_chat(
@@ -467,6 +467,11 @@ async def handle_run(args: argparse.Namespace) -> None:
                 sys.stdout.flush()
 
     wire_prompt = resolve_prompt_with_bridge(raw_prompt, active_bridge)
+    system_hints, selected_mcp_sources = (
+        await asyncio.to_thread(resolve_connector_context, active_bridge)
+        if getattr(args, "bridge", None) and active_bridge
+        else ([], [])
+    )
 
     last_event_time = time.monotonic()
     def on_event_with_timer(ev):
@@ -495,7 +500,11 @@ async def handle_run(args: argparse.Namespace) -> None:
             effort=getattr(args, "effort", "extended"),
             emit_event=on_event_with_timer,
         )
-        result = await runner.run_initial(wire_prompt)
+        result = await runner.run_initial(
+            wire_prompt,
+            system_hints=system_hints,
+            selected_mcp_sources=selected_mcp_sources,
+        )
         sess = reg.require_session(sess.local_id)
     except KeyboardInterrupt:
         if not getattr(args, "json", False):

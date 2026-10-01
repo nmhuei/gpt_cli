@@ -84,6 +84,7 @@ class ConduitHandshake:
         user_agent: str | None = None,
         conversation_id: str | None = None,
         parent_id: str | None = None,
+        system_hints: list[str] | None = None,
     ) -> tuple[dict[str, str], str, str, str | None]:
         ua = user_agent or defaults.DEFAULT_USER_AGENT
         turn_session_id = str(uuid.uuid4())
@@ -156,7 +157,7 @@ class ConduitHandshake:
             "parent_message_id": parent_id or "client-created-root",
             "supported_encodings": ["v1"],
             "supports_buffering": True,
-            "system_hints": [],
+            "system_hints": list(system_hints or []),
             "timezone": "Asia/Ho_Chi_Minh",
             "timezone_offset_min": tz_offset,
         }

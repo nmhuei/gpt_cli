@@ -104,6 +104,51 @@ def test_wire_payload_construction():
     assert payload["messages"][0]["content"]["parts"] == ["Test message"]
 
 
+def test_wire_payload_carries_selected_mcp_connector_as_system_hint():
+    transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+
+    payload = transport.build_payload(
+        prompt="@br bind Chrono_II; solve",
+        system_hints=["connector_br"],
+    )
+
+    assert payload["system_hints"] == ["connector_br"]
+
+
+def test_wire_payload_carries_selected_mcp_source_in_user_metadata():
+    transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+    source = {"id": "connector_br", "name": "br", "actions": []}
+
+    payload = transport.build_payload(
+        prompt="@br bind Chrono_II; solve",
+        selected_mcp_sources=[source],
+    )
+
+    assert payload["messages"][0]["metadata"]["selected_mcp_sources"] == [source]
+
+
+def test_wire_turn_passes_connector_hint_to_prepare_and_conversation():
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+
+        class Response:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_1","message":{"id":"msg_1","author":{"role":"assistant"},"recipient":"all","channel":"final","content":{"content_type":"text","parts":["done"]},"status":"finished_successfully"}}\n\n'
+
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as prepare:
+            prepare.return_value = ({"Authorization": "Bearer fake"}, "wire_session", "trace_1", None)
+            transport.session.post = AsyncMock(return_value=Response())
+
+            await transport._send_once("@br bind Chrono_II; solve", system_hints=["connector_br"])
+
+        assert prepare.call_args.kwargs["system_hints"] == ["connector_br"]
+        assert transport.session.post.call_args.kwargs["json"]["system_hints"] == ["connector_br"]
+
+    asyncio.run(_run())
+
+
 def test_wire_steer_payload_uses_observed_async_turn_context():
     """A wrong route or missing async id would steer an unrelated upstream turn."""
     async def _run():

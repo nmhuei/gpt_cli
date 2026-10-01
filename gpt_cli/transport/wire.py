@@ -27,7 +27,9 @@ class WireTransport:
         conversation_id: str | None = None,
         parent_id: str | None = None,
         model_alias: str | None = None,
-        effort: str | None = None
+        effort: str | None = None,
+        system_hints: list[str] | None = None,
+        selected_mcp_sources: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         model_def = ModelRegistry.resolve(model_alias)
         chosen_effort = effort or model_def.default_effort
@@ -35,21 +37,24 @@ class WireTransport:
             chosen_effort = "standard" if chosen_effort in ("low", "none", "off", "min", "medium") else "extended"
 
         msg_id = str(uuid.uuid4())
+        message: dict[str, Any] = {
+            "id": msg_id,
+            "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": [prompt]},
+        }
+        if selected_mcp_sources:
+            message["metadata"] = {"selected_mcp_sources": list(selected_mcp_sources)}
         payload: dict[str, Any] = {
             "action": "next",
-            "messages": [
-                {
-                    "id": msg_id,
-                    "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": [prompt]},
-                }
-            ],
+            "messages": [message],
             "model": model_def.slug,
             "parent_message_id": parent_id or "client-created-root",
             "conversation_mode": {"kind": "primary_assistant"},
         }
         if model_def.supports_thinking:
             payload["thinking_effort"] = chosen_effort
+        if system_hints:
+            payload["system_hints"] = list(system_hints)
         if conversation_id and parent_id and parent_id != "client-created-root":
             payload["conversation_id"] = conversation_id
         else:
@@ -111,6 +116,8 @@ class WireTransport:
         parent_id: str | None = None,
         model_alias: str | None = None,
         effort: str | None = None,
+        system_hints: list[str] | None = None,
+        selected_mcp_sources: list[dict[str, Any]] | None = None,
         on_event: Callable[[Any], None] | None = None,
     ) -> TurnResult:
         model_def = ModelRegistry.resolve(model_alias)
@@ -124,6 +131,7 @@ class WireTransport:
             user_agent=self.user_agent,
             conversation_id=conversation_id,
             parent_id=parent_id,
+            system_hints=system_hints,
         )
         self.latest_turn_headers = dict(headers)
         self.latest_turn_trace_id = t_id
@@ -135,6 +143,8 @@ class WireTransport:
             parent_id=parent_id,
             model_alias=model_alias,
             effort=effort,
+            system_hints=system_hints,
+            selected_mcp_sources=selected_mcp_sources,
         )
 
         # Step 3: Post Conversation Stream
@@ -286,6 +296,8 @@ class WireTransport:
         parent_id: str | None = None,
         model_alias: str | None = None,
         effort: str | None = None,
+        system_hints: list[str] | None = None,
+        selected_mcp_sources: list[dict[str, Any]] | None = None,
         on_event: Callable[[Any], None] | None = None,
         max_retries: int = 5,
     ) -> TurnResult:
@@ -308,6 +320,8 @@ class WireTransport:
                     parent_id=parent_id,
                     model_alias=model_alias,
                     effort=effort,
+                    system_hints=system_hints,
+                    selected_mcp_sources=selected_mcp_sources,
                     on_event=observe_event,
                 )
                 # If incomplete, stream has already delivered partial progress; do not auto-replay prompt

@@ -48,8 +48,18 @@ class SessionTurnRunner:
         self._transport: Any | None = None
         self._steer_context: SteerContext | None = None
         self._active_parent_id: str | None = None
+        self._system_hints: list[str] = []
+        self._selected_mcp_sources: list[dict[str, Any]] = []
 
-    async def run_initial(self, prompt: str) -> TurnResult:
+    async def run_initial(
+        self,
+        prompt: str,
+        *,
+        system_hints: list[str] | None = None,
+        selected_mcp_sources: list[dict[str, Any]] | None = None,
+    ) -> TurnResult:
+        self._system_hints = list(system_hints or [])
+        self._selected_mcp_sources = list(selected_mcp_sources or [])
         socket_path = Path(self.live_registry.runtime_dir) / f"{self.session.local_id}.sock"
         owner = TurnOwner.create_for_current_process(self.session.local_id, socket_path)
         self.live_registry.claim(owner)
@@ -170,13 +180,20 @@ class SessionTurnRunner:
             if self.emit_event is not None:
                 self.emit_event(event)
 
+        send_args = {
+            "prompt": prompt,
+            "conversation_id": self.session.conversation_id,
+            "parent_id": self.session.last_message_id,
+            "model_alias": self.model,
+            "effort": self.effort,
+            "on_event": on_event,
+        }
+        if self._system_hints:
+            send_args["system_hints"] = self._system_hints
+        if self._selected_mcp_sources:
+            send_args["selected_mcp_sources"] = self._selected_mcp_sources
         result = await self._transport.send_turn(
-            prompt=prompt,
-            conversation_id=self.session.conversation_id,
-            parent_id=self.session.last_message_id,
-            model_alias=self.model,
-            effort=self.effort,
-            on_event=on_event,
+            **send_args,
         )
         final_conversation = result.conversation_id or self.session.conversation_id or ""
         final_message = result.message_id or self.session.last_message_id or ""

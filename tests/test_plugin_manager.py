@@ -43,6 +43,21 @@ def test_list_plugins(mock_cache_mgr):
         all_plugins = mgr.list_plugins(include_system=True)
         assert len(all_plugins) == 2
 
+
+def test_get_connector_source_returns_native_connector_metadata(mock_cache_mgr):
+    with patch("gpt_cli.plugins.manager.requests.Session") as mock_session_cls:
+        session_instance = MagicMock()
+        mock_session_cls.return_value = session_instance
+        session_instance.get.return_value.status_code = 200
+        session_instance.get.return_value.json.return_value = {
+            "id": "conn_123", "name": "bqa", "actions": [{"name": "host_workspace_bind"}],
+        }
+
+        source = PluginManager(cache_mgr=mock_cache_mgr).get_connector_source("conn_123")
+
+        assert source["id"] == "conn_123"
+        assert source["actions"] == [{"name": "host_workspace_bind"}]
+
 def test_add_mcp_plugin_flow(mock_cache_mgr):
     with patch("gpt_cli.plugins.manager.requests.Session") as mock_session_cls:
         session_instance = MagicMock()

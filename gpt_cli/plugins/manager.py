@@ -139,6 +139,17 @@ class PluginManager:
                 return p
         return None
 
+    def get_connector_source(self, connector_id: str) -> dict[str, Any]:
+        """Fetch the native connector object used in message source metadata."""
+        url = f"{self.base_url}/backend-api/aip/connectors/{connector_id}"
+        response = self.session.get(url, headers=self.headers)
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to fetch connector source: HTTP {response.status_code}")
+        source = response.json()
+        if not isinstance(source, dict) or source.get("id") != connector_id:
+            raise RuntimeError("Connector source response did not match the requested connector")
+        return source
+
     def add_mcp_plugin(
         self,
         name: str,

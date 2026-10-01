@@ -3,7 +3,7 @@ import sys
 
 import pytest
 import gpt_cli.cli.main as cli_main
-from gpt_cli.core.bridge import resolve_prompt_with_bridge
+from gpt_cli.core.bridge import resolve_connector_context, resolve_connector_system_hints, resolve_prompt_with_bridge
 
 def test_resolve_prompt_bracket_mention():
     p = "@[br] con song k"
@@ -55,6 +55,44 @@ def test_resolve_prompt_already_wrapped_no_double():
     p = "[Use MCP connector @[br] for this request]: solve"
     res = resolve_prompt_with_bridge(p, bridge_name="br")
     assert res == "@br solve"
+
+
+def test_resolve_connector_system_hints_uses_registered_connector_id(monkeypatch):
+    class Plugin:
+        connector_id = "connector_br"
+        auth_status = "ACTIVE"
+
+    class PluginManager:
+        def find_plugin(self, name):
+            assert name == "br"
+            return Plugin()
+
+        def get_connector_source(self, connector_id):
+            return {"id": connector_id}
+
+    monkeypatch.setattr("gpt_cli.plugins.manager.PluginManager", PluginManager)
+
+    assert resolve_connector_system_hints("br") == ["connector_br"]
+
+
+def test_resolve_connector_context_includes_native_source_metadata(monkeypatch):
+    class Plugin:
+        connector_id = "connector_br"
+        auth_status = "ACTIVE"
+
+    class PluginManager:
+        def find_plugin(self, name):
+            return Plugin()
+
+        def get_connector_source(self, connector_id):
+            return {"id": connector_id, "name": "br", "actions": []}
+
+    monkeypatch.setattr("gpt_cli.plugins.manager.PluginManager", PluginManager)
+
+    assert resolve_connector_context("br") == (
+        ["connector_br"],
+        [{"id": "connector_br", "name": "br", "actions": []}],
+    )
 
 
 def test_status_json_does_not_shadow_module_json(monkeypatch, capsys):

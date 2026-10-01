@@ -1,5 +1,25 @@
 import re
 
+
+def resolve_connector_context(connector_name: str | None) -> tuple[list[str], list[dict]]:
+    """Resolve a configured MCP connector to native turn-selection fields."""
+    if not connector_name:
+        return [], []
+
+    from ..plugins.manager import PluginManager
+
+    manager = PluginManager()
+    connector = manager.find_plugin(connector_name)
+    if connector is None or connector.auth_status != "ACTIVE" or not connector.connector_id:
+        raise RuntimeError(f"Active MCP connector not found: {connector_name}")
+    source = manager.get_connector_source(connector.connector_id)
+    return [connector.connector_id], [source]
+
+
+def resolve_connector_system_hints(connector_name: str | None) -> list[str]:
+    """Compatibility helper for callers that only need prepare-time hints."""
+    return resolve_connector_context(connector_name)[0]
+
 def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> str:
     """
     Resolve an explicit connector mention into ChatGPT's native mention syntax.
