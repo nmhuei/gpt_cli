@@ -12,6 +12,11 @@ from typing import Any
 from .models import SessionRecord
 from ..config import defaults
 
+
+class SessionLookupError(LookupError):
+    """Raised when an explicit resume target does not exist."""
+
+
 class SessionRegistry:
     """Manages tool-created sessions stored in tool_sessions.json with process-safe file locking."""
 
@@ -110,6 +115,21 @@ class SessionRegistry:
             if raw is not None:
                 return SessionRecord(**raw)
             return None
+
+    def require_session(self, session_id: str | None) -> SessionRecord:
+        """Return an existing active or named session without creating one."""
+        if session_id is None:
+            session = self.get_active()
+            if session is None:
+                raise SessionLookupError(
+                    "No active local session; run a fresh prompt or name a session"
+                )
+            return session
+
+        session = self.get_session(session_id)
+        if session is None:
+            raise SessionLookupError(f"Local session does not exist: {session_id}")
+        return session
 
     def create_session(self, local_id: str | None = None, tag: str | None = None, set_active: bool = True) -> SessionRecord:
         with self._lock():

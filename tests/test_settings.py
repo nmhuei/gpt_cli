@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from gpt_cli.config import defaults
 from gpt_cli.config.settings import Settings
 
 
@@ -38,3 +39,11 @@ def test_mcp_url_resolution_prefers_explicit_environment_then_discovery_file(mon
 
     monkeypatch.delenv("DEFAULT_MCP_URL")
     assert Settings().resolve_mcp_url() == "https://dynamic.example/mcp"
+
+
+def test_runtime_directory_and_steer_endpoint_use_expected_paths(monkeypatch, tmp_path):
+    """Live control state must stay private and steer must target its own route."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+    assert defaults.user_runtime_dir() == tmp_path / "runtime/webgpt"
+    assert defaults.FCONV_STEER_URL == "https://chatgpt.com/backend-api/f/steer_turn"

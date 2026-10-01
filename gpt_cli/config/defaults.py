@@ -18,6 +18,14 @@ def user_config_dir() -> Path:
     return Path.home() / ".config" / "gpt_cli"
 
 
+def user_runtime_dir() -> Path:
+    """Return the private runtime root used by short-lived local control sockets."""
+    root = os.getenv("XDG_RUNTIME_DIR")
+    if root:
+        return Path(root).expanduser() / "webgpt"
+    return user_data_dir() / "runtime"
+
+
 def default_mcp_tunnel_file() -> Path:
     return user_config_dir() / "mcp" / "tunnel_url.txt"
 
@@ -39,6 +47,7 @@ SENTINEL_PREPARE_URL = "https://chatgpt.com/backend-api/sentinel/chat-requiremen
 SENTINEL_CLASSIC_URL = "https://chatgpt.com/backend-api/sentinel/chat-requirements"
 FCONV_PREPARE_URL = "https://chatgpt.com/backend-api/f/conversation/prepare"
 FCONV_CONVERSATION_URL = "https://chatgpt.com/backend-api/f/conversation"
+FCONV_STEER_URL = "https://chatgpt.com/backend-api/f/steer_turn"
 
 # User-Agent matching impersonated Chrome/146 on Windows
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
