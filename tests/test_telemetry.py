@@ -83,6 +83,29 @@ def test_parse_classic_accumulated_deltas():
 
     assert any(e.event_type == "done" for e in events)
 
+
+def test_parse_async_task_identity_once_from_classic_metadata():
+    """Losing async-task metadata would make native steer unsafe to attempt."""
+    parser = SSETelemetryParser()
+    frame = {
+        "message": {
+            "id": "msg_async",
+            "author": {"role": "assistant"},
+            "recipient": "all",
+            "channel": "commentary",
+            "content": {"content_type": "text", "parts": ["working"]},
+            "metadata": {"async_task_id": "task_1", "async_task_turn_id": "turn_1"},
+        }
+    }
+    raw = f"data: {json.dumps(frame)}\n\ndata: {json.dumps(frame)}\n\n".encode("utf-8")
+
+    events = parser.feed(raw)
+
+    async_events = [event for event in events if event.event_type == "async_task"]
+    assert [event.data for event in async_events] == [
+        {"async_task_id": "task_1", "async_task_turn_id": "turn_1"}
+    ]
+
 def test_parse_v1_patch_deltas():
     parser = SSETelemetryParser()
     f1 = {"conversation_id": "conv_200", "p": "/message/content/parts/0", "o": "append", "v": "Chunk 1 "}

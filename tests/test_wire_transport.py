@@ -2,7 +2,7 @@ import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from gpt_cli.core.types import TokenBundle, TurnResult
+from gpt_cli.core.types import SteerContext, TokenBundle, TurnResult
 from gpt_cli.models.registry import ModelRegistry
 from gpt_cli.transport.wire import WireTransport
 from gpt_cli.transport.conduit import ConduitHandshake
@@ -102,6 +102,57 @@ def test_wire_payload_construction():
     assert payload["conversation_id"] == "conv_123"
     assert payload["parent_message_id"] == "msg_456"
     assert payload["messages"][0]["content"]["parts"] == ["Test message"]
+
+
+def test_wire_steer_payload_uses_observed_async_turn_context():
+    """A wrong route or missing async id would steer an unrelated upstream turn."""
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+        context = SteerContext(
+            conversation_id="conv_1",
+            parent_message_id="msg_1",
+            model="gpt-5-6-thinking",
+            async_task_id="task_1",
+            async_task_turn_id="turn_1",
+            headers={"x-oai-turn-trace-id": "trace_1", "Accept": "text/event-stream"},
+        )
+        response = MagicMock(status_code=200)
+        transport.session.post = AsyncMock(return_value=response)
+
+        accepted = await transport.send_steer("answer with the risks", context)
+
+        assert accepted is True
+        request_url, = transport.session.post.call_args.args
+        request = transport.session.post.call_args.kwargs
+        assert request_url == "https://chatgpt.com/backend-api/f/steer_turn"
+        assert request["headers"]["x-openai-target-path"] == "/backend-api/f/steer_turn"
+        assert request["headers"]["x-openai-target-route"] == "/backend-api/f/steer_turn"
+        assert request["headers"]["Accept"] == "application/json"
+        assert request["json"]["async_task_id"] == "task_1"
+        assert request["json"]["async_task_turn_id"] == "turn_1"
+        assert request["json"]["conversation_id"] == "conv_1"
+        assert request["json"]["parent_message_id"] == "msg_1"
+        assert request["json"]["messages"][0]["content"]["parts"] == ["answer with the risks"]
+
+    asyncio.run(_run())
+
+
+def test_wire_steer_rejection_is_not_reported_as_success():
+    """Treating a non-2xx steer response as success would silently drop an instruction."""
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+        context = SteerContext(
+            conversation_id="conv_1",
+            parent_message_id="msg_1",
+            model="gpt-5-6-thinking",
+            async_task_id="task_1",
+            headers={},
+        )
+        transport.session.post = AsyncMock(return_value=MagicMock(status_code=409))
+
+        assert await transport.send_steer("queue me", context) is False
+
+    asyncio.run(_run())
 
 def test_wire_incomplete_stream_marked_properly():
     async def _run():
