@@ -154,6 +154,28 @@ def test_wire_steer_rejection_is_not_reported_as_success():
 
     asyncio.run(_run())
 
+
+def test_wire_retains_prepared_headers_for_a_live_native_steer():
+    """Discarding prepared auth headers would force every native steer to fail."""
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+
+        class Response:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_1","message":{"id":"msg_1","author":{"role":"assistant"},"recipient":"all","channel":"final","content":{"content_type":"text","parts":["done"]},"status":"finished_successfully"}}\n\n'
+
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as prepare:
+            prepare.return_value = ({"Authorization": "Bearer fake"}, "wire_session", "trace_1", None)
+            transport.session.post = AsyncMock(return_value=Response())
+            await transport._send_once("hi")
+
+        assert transport.latest_turn_headers == {"Authorization": "Bearer fake"}
+        assert transport.latest_turn_trace_id == "trace_1"
+
+    asyncio.run(_run())
+
 def test_wire_incomplete_stream_marked_properly():
     async def _run():
         bundle = TokenBundle(access_token="fake", oai_device_id="dev")

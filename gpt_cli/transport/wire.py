@@ -18,6 +18,8 @@ class WireTransport:
         self.bundle = bundle
         self.user_agent = user_agent or defaults.DEFAULT_USER_AGENT
         self.session = AsyncSession(impersonate="chrome146")
+        self.latest_turn_headers: dict[str, str] = {}
+        self.latest_turn_trace_id: str | None = None
 
     def build_payload(
         self,
@@ -123,6 +125,8 @@ class WireTransport:
             conversation_id=conversation_id,
             parent_id=parent_id,
         )
+        self.latest_turn_headers = dict(headers)
+        self.latest_turn_trace_id = t_id
 
         # Step 2: Build Payload
         payload = self.build_payload(
