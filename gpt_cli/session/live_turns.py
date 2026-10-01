@@ -275,6 +275,22 @@ class LiveTurnRegistry:
                     return
             raise LookupError(f"No claimed steer request {request_id} for {session_id}")
 
+    def queued_prompts(self, session_id: str) -> list[str]:
+        """Return every accepted instruction, including a currently claimed one."""
+        with self._lock():
+            self._load()
+            raw = self._require_raw(session_id)
+            queue = raw.get("queue", [])
+            if not isinstance(queue, list):
+                return []
+            return [
+                prompt
+                for entry in queue
+                if isinstance(entry, dict)
+                and isinstance((prompt := entry.get("prompt")), str)
+                and prompt.strip()
+            ]
+
     def update_upstream(
         self,
         session_id: str,

@@ -83,6 +83,11 @@ class SessionTurnRunner:
                 return initial
         finally:
             self._transport = None
+            if self._owner is not None:
+                self.registry.preserve_pending_steers(
+                    self.session.local_id,
+                    self.live_registry.queued_prompts(self.session.local_id),
+                )
             if self._control is not None:
                 await self._control.close()
                 self._control = None

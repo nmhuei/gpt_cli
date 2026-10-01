@@ -242,6 +242,24 @@ class SessionRegistry:
             self._save()
             return SessionRecord(**session)
 
+    def preserve_pending_steers(self, local_id: str, prompts: list[str]) -> SessionRecord | None:
+        """Persist accepted instructions that outlive a failed live-turn owner."""
+        clean_prompts = [prompt.strip() for prompt in prompts if prompt.strip()]
+        if not clean_prompts:
+            return self.get_session(local_id)
+        with self._lock():
+            self._load()
+            session = self._data.get("sessions", {}).get(local_id)
+            if session is None:
+                return None
+            pending = session.setdefault("pending_steers", [])
+            if not isinstance(pending, list):
+                pending = session["pending_steers"] = []
+            pending.extend(clean_prompts)
+            session["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save()
+            return SessionRecord(**session)
+
     def list_sessions(self) -> list[SessionRecord]:
         with self._lock():
             self._load()

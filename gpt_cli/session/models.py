@@ -1,4 +1,4 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any
 
 @dataclass
@@ -10,6 +10,7 @@ class SessionRecord:
     model: str | None = None
     bqa_chat_id: str | None = None
     bqa_workspace_path: str | None = None
+    pending_steers: list[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
     turns: int = 0

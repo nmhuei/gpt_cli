@@ -81,6 +81,47 @@ It has not been reproduced or traced through the CTF command parser, so it is
 not classified as a product defect yet.  The GPT run is independent of that
 read-only status command.
 
+### OBS-004 — delayed MCP execution can exceed the requested host-command SLA
+
+A collection request declared a 130-second workload and a 160-second MCP
+timeout.  Its `tool_call_started` event preceded the actual FastMCP child
+process by several minutes.  Once the child began, it ran normally and the
+same SSE turn emitted subsequent results.
+
+**Root cause:** this is queueing/dispatch latency inside the external BQA
+FastMCP service, before the host command starts.  `gpt_cli` retained a live
+SSE connection and received normal events; it did not drop the timeout or
+lose the turn.
+
+**Disposition:** no `gpt_cli` code change is appropriate.  The future
+controller should surface this as `tool-queued` after a configurable
+no-progress threshold, keep the session alive, and avoid launching a second
+same-session turn.  An actual `tool-timeout` requires a timeout/error event
+or a recovered terminal lifecycle state, not elapsed time alone.
+
+### INC-003 — a queued steer can be discarded after an incomplete turn
+
+**Observed:** Two `continue` requests were accepted while `Chrono_II` was
+live.  The first became turn 5; after that turn the runner exited with the
+second request never executed.  No live record remained, so the in-memory
+queue could no longer be recovered through `gpt steer`.
+
+**Root cause:** `SessionTurnRunner.run_initial()` stops draining when a queued
+turn is not classified `completed` or `terminal`.  Its `finally` block calls
+`LiveTurnRegistry.release()`, which deletes the live record and all remaining
+queued requests.  A response may be classed incomplete when an upstream tool
+call lacks a matching completion event, even though useful text and a new DAG
+parent were recorded.
+
+**Immediate recovery:** resume the saved local session with `continue`.  The
+session registry has already checkpointed its new parent message and bound BQA
+workspace, so this creates no new conversation.
+
+**Required fix:** persist unconsumed queued instructions outside the
+owner-scoped live record before release, and drain them only after lifecycle
+recovery says the upstream turn is safe to continue.  Do not blindly send them
+on an active server turn.
+
 ## Operating invariants
 
 1. A new prompt starts a new conversation by default.  Resuming requires

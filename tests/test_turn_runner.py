@@ -10,10 +10,17 @@ from gpt_cli.telemetry.events import TelemetryEvent
 
 
 class FakeWireTransport:
-    def __init__(self, release_first: asyncio.Event, native_steer: bool = False, workspace_output: str | None = None):
+    def __init__(
+        self,
+        release_first: asyncio.Event,
+        native_steer: bool = False,
+        workspace_output: str | None = None,
+        result_statuses: list[str] | None = None,
+    ):
         self.release_first = release_first
         self.native_steer = native_steer
         self.workspace_output = workspace_output
+        self.result_statuses = result_statuses or []
         self.initial_started = asyncio.Event()
         self.calls: list[tuple[str, str | None, str | None]] = []
         self.steer_prompts: list[str] = []
@@ -46,7 +53,7 @@ class FakeWireTransport:
             conversation_id="conv_1",
             message_id=f"msg_{index}",
             model="gpt-5-6-thinking",
-            status="completed",
+            status=self.result_statuses[index - 1] if index <= len(self.result_statuses) else "completed",
         )
 
     async def send_steer(self, prompt, context):
@@ -111,6 +118,26 @@ def test_runner_reports_native_steer_without_enqueuing_followup_turn(tmp_path: P
 
         assert fake.steer_prompts == ["answer now"]
         assert [call[0] for call in fake.calls] == ["initial"]
+
+    asyncio.run(run())
+
+
+def test_runner_preserves_unconsumed_steers_after_incomplete_turn(tmp_path: Path):
+    """Accepted steering must survive owner release when the upstream turn is unsafe to continue."""
+    async def run() -> None:
+        release = asyncio.Event()
+        fake = FakeWireTransport(release, result_statuses=["completed", "incomplete"])
+        runner, registry = _runner(tmp_path, fake)
+        initial = asyncio.create_task(runner.run_initial("initial"))
+        await fake.initial_started.wait()
+
+        await runner.request_steer("r1", "first")
+        await runner.request_steer("r2", "second")
+        release.set()
+        await initial
+
+        assert [call[0] for call in fake.calls] == ["initial", "first"]
+        assert registry.require_session("sess_one").pending_steers == ["first", "second"]
 
     asyncio.run(run())
 
