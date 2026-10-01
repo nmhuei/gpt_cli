@@ -153,6 +153,7 @@ class WireTransport:
             system_hints=system_hints,
             selected_mcp_sources=selected_mcp_sources,
         )
+        request_message_id = payload["messages"][0]["id"]
 
         # Step 3: Post Conversation Stream
         timeout_sec = Settings().timeout_seconds
@@ -256,8 +257,26 @@ class WireTransport:
                 self.bundle, session=self.session, user_agent=self.user_agent
             )
             try:
-                dag_state = await recovery.fetch(captured_conv_id)
-                lifecycle_status = classify_lifecycle(observed_events, dag_state).value
+                dag_state = await recovery.fetch(
+                    captured_conv_id,
+                    expected_user_message_id=request_message_id,
+                )
+                recovered_completed_answer = (
+                    stream_err is not None
+                    and dag_state.matches_expected_message is True
+                    and dag_state.role == "assistant"
+                    and dag_state.recipient in (None, "", "all", "final")
+                    and dag_state.content_type == "text"
+                    and bool(dag_state.finish_type)
+                    and bool(dag_state.node_id)
+                )
+                if recovered_completed_answer:
+                    full_text = [dag_state.text]
+                    last_msg_id = dag_state.node_id
+                    stream_err = None
+                    lifecycle_status = "completed_turn"
+                else:
+                    lifecycle_status = classify_lifecycle(observed_events, dag_state).value
             except Exception as recovery_error:
                 if stream_err is None:
                     stream_err = recovery_error

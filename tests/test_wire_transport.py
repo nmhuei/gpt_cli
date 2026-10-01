@@ -1,6 +1,7 @@
 import asyncio
 import json
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from gpt_cli.core.types import SteerContext, TokenBundle, TurnResult
 from gpt_cli.models.registry import ModelRegistry
@@ -74,6 +75,7 @@ def test_conversation_recovery_fetches_current_node_with_target_route():
         state = await recovery.fetch("conv_123")
 
         assert state == ConversationState(
+            node_id="node_final",
             role="assistant",
             recipient="all",
             content_type="text",
@@ -277,6 +279,48 @@ def test_wire_reports_server_active_when_sse_drops_during_upstream_tool():
         assert result.status == "incomplete"
         assert result.lifecycle_status == "server_active"
         assert "socket dropped" in str(result.error)
+
+    asyncio.run(_run())
+
+
+def test_wire_recovers_completed_text_from_dag_after_sse_error():
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        transport = WireTransport(bundle)
+
+        class MockResponse:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_recovered","error":"unusual activity"}\n\n'
+                yield b'data: [DONE]\n\n'
+
+        recovered = SimpleNamespace(
+            role="assistant",
+            recipient="all",
+            content_type="text",
+            message_status="finished_successfully",
+            finish_type="stop",
+            node_id="assistant_final",
+            text="Recovered server answer",
+            matches_expected_message=True,
+        )
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as mock_prep:
+            mock_prep.return_value = ({}, "s1", "t1", None)
+            with patch.object(transport.session, "post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = MockResponse()
+                with patch(
+                    "gpt_cli.transport.conversation.ConversationRecovery.fetch",
+                    new_callable=AsyncMock,
+                    return_value=recovered,
+                ):
+                    result = await transport._send_once(prompt="hello")
+
+        assert result.status == "completed"
+        assert result.lifecycle_status == "completed_turn"
+        assert result.text == "Recovered server answer"
+        assert result.message_id == "assistant_final"
+        assert result.error is None
 
     asyncio.run(_run())
 

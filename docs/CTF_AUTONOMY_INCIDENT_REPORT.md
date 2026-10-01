@@ -145,6 +145,24 @@ configurable through `WEBGPT_REQUEST_INTERVAL_SECONDS` and
 `WEBGPT_RUN_LIVE_TESTS=1`; normal unit tests never read the real runtime
 admission file or send test traffic.
 
+### INC-005 — SSE error can race with a durable completed server turn
+
+**Observed:** A turn emitted an SSE `unusual activity` error and no response
+text locally. A read-only conversation DAG fetch immediately afterwards showed
+the exact user node, a completed reasoning node, and a completed final
+assistant text node.
+
+**Root cause:** `ConversationRecovery` returned only node metadata. The wire
+transport retained the SSE error as authoritative and discarded the completed
+assistant text and node ID, even when the final node was a descendant of the
+request just sent.
+
+**Fix:** recovery now returns the current node ID and text, verifies its
+ancestry against the submitted user message ID, and converts the turn to a
+completed result only when that exact descendant is a finished assistant text
+node. It does not suppress an error for an unrelated, incomplete, or still
+tool-running DAG.
+
 ## Operating invariants
 
 1. A new prompt starts a new conversation by default.  Resuming requires
@@ -163,6 +181,9 @@ admission file or send test traffic.
 6. Treat SSE `unusual activity` and HTTP 429 as a shared upstream admission
    failure. Stop all new turns until the recorded cooldown expires; do not
    convert it into an auth/browser-refresh attempt.
+7. Before marking an SSE failure as terminal, query the conversation DAG. A
+   completed assistant descendant of the submitted user node is authoritative
+   for that one turn; otherwise preserve the transport failure or active state.
 
 ## Remaining autonomy gap
 
