@@ -1,10 +1,11 @@
 import asyncio
+import calendar
 import json
 import uuid
 import time
 from typing import Any, Callable
 from curl_cffi.requests import AsyncSession
-from ..core.types import TokenBundle, TurnResult
+from ..core.types import SteerContext, TokenBundle, TurnResult
 from ..config import defaults
 from ..config.settings import Settings
 from ..models.registry import ModelRegistry
@@ -17,6 +18,8 @@ class WireTransport:
         self.bundle = bundle
         self.user_agent = user_agent or defaults.DEFAULT_USER_AGENT
         self.session = AsyncSession(impersonate="chrome146")
+        self.latest_turn_headers: dict[str, str] = {}
+        self.latest_turn_trace_id: str | None = None
 
     def build_payload(
         self,
@@ -53,6 +56,54 @@ class WireTransport:
             payload["parent_message_id"] = "client-created-root"
         return payload
 
+    def build_steer_payload(self, prompt: str, context: SteerContext) -> dict[str, Any]:
+        """Build the observed native async-task steer request body."""
+        if not context.async_task_id:
+            raise ValueError("Native steer requires an async task id")
+        timestamp = time.time()
+        local_time = time.localtime(timestamp)
+        timezone_offset = round((calendar.timegm(local_time) - int(timestamp)) / 60.0)
+        return {
+            "action": "next",
+            "messages": [{
+                "id": str(uuid.uuid4()),
+                "author": {"role": "user"},
+                "content": {"content_type": "text", "parts": [prompt]},
+            }],
+            "conversation_id": context.conversation_id,
+            "parent_message_id": context.parent_message_id,
+            "model": context.model,
+            "client_prepare_state": context.client_prepare_state,
+            "conversation_mode": {"kind": "primary_assistant"},
+            "timezone": "Asia/Ho_Chi_Minh",
+            "timezone_offset_min": timezone_offset,
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "async_task_id": context.async_task_id,
+            "steer_turn_action": context.steer_turn_action,
+            **({"async_task_turn_id": context.async_task_turn_id} if context.async_task_turn_id else {}),
+        }
+
+    async def send_steer(self, prompt: str, context: SteerContext) -> bool:
+        """Submit native steer only for a parser-observed async upstream turn."""
+        payload = self.build_steer_payload(prompt, context)
+        headers = dict(context.headers)
+        headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-openai-target-path": "/backend-api/f/steer_turn",
+            "x-openai-target-route": "/backend-api/f/steer_turn",
+        })
+        if context.turn_trace_id:
+            headers["x-oai-turn-trace-id"] = context.turn_trace_id
+        response = await self.session.post(
+            defaults.FCONV_STEER_URL,
+            headers=headers,
+            json=payload,
+            timeout=Settings().timeout_seconds,
+        )
+        return 200 <= response.status_code < 300
+
     async def _send_once(
         self,
         prompt: str,
@@ -74,6 +125,8 @@ class WireTransport:
             conversation_id=conversation_id,
             parent_id=parent_id,
         )
+        self.latest_turn_headers = dict(headers)
+        self.latest_turn_trace_id = t_id
 
         # Step 2: Build Payload
         payload = self.build_payload(

@@ -36,6 +36,7 @@ class SSETelemetryParser:
         self._current_author_name: str | None = None
         self._current_content_type: str | None = None
         self._active_tool_calls: dict[str, str] = {}
+        self._last_async_task_key: tuple[str, str | None] | None = None
 
     @staticmethod
     def _reference_id(message: dict[str, Any], metadata: dict[str, Any]) -> str | None:
@@ -221,6 +222,23 @@ class SSETelemetryParser:
             self._current_recipient = recipient
             self._current_author_name = author.get("name")
             self._current_content_type = content.get("content_type")
+
+            async_task_id = metadata.get("async_task_id")
+            async_task_turn_id = metadata.get("async_task_turn_id")
+            if isinstance(async_task_id, str) and async_task_id:
+                async_key = (
+                    async_task_id,
+                    async_task_turn_id if isinstance(async_task_turn_id, str) and async_task_turn_id else None,
+                )
+                if async_key != self._last_async_task_key:
+                    self._last_async_task_key = async_key
+                    events.append(TelemetryEvent(
+                        event_type="async_task",
+                        data={
+                            "async_task_id": async_key[0],
+                            "async_task_turn_id": async_key[1],
+                        },
+                    ))
 
             # Capture message ID (track assistant nodes for conversation continuity)
             msg_id = msg.get("id")

@@ -3,7 +3,7 @@ from starlette.testclient import TestClient
 from pathlib import Path
 from gpt_cli.server.app import create_app
 from gpt_cli.session.registry import SessionRegistry
-from gpt_cli.cli.main import build_cli_parser
+from gpt_cli.cli.main import build_cli_parser, parse_cli_args
 
 def test_gateway_health():
     app = create_app()
@@ -31,12 +31,35 @@ def test_gateway_messages_empty_validation():
 
 def test_cli_parser_run_command():
     parser = build_cli_parser()
-    args = parser.parse_args(["run", "-p", "Test prompt", "--json", "-s", "sess_custom", "--new"])
+    args = parser.parse_args(["run", "-p", "Test prompt", "--json", "--resume-session", "sess_custom"])
     assert args.command == "run"
     assert args.prompt == "Test prompt"
     assert args.json is True
-    assert args.session == "sess_custom"
-    assert args.new is True
+    assert args.resume_session == "sess_custom"
+
+
+def test_cli_parser_accepts_bridge_prompt_shortcut_without_run_command():
+    args = parse_cli_args(["-b", "br", "-p", "solve /tmp/challenge"])
+
+    assert args.command == "run"
+    assert args.bridge == "br"
+    assert args.prompt == "solve /tmp/challenge"
+    assert args.resume is False
+
+
+def test_cli_parser_makes_new_and_resume_contract_unambiguous():
+    """Restoring old implicit-session flags would reintroduce cross-task contamination."""
+    parser = build_cli_parser()
+
+    assert parser.parse_args(["run", "fresh work"]).resume is False
+    assert parser.parse_args(["run", "--resume", "continue"]).resume is True
+    assert parser.parse_args(["steer", "--resume-session", "sess_a", "check tests"]).command == "steer"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--new", "x"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["new", "x"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--resume", "--conversation", "web_uuid", "x"])
 
 def test_cli_parser_session_command():
     parser = build_cli_parser()
@@ -61,6 +84,7 @@ def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, t
     monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
     monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
 
     async def fake_send_turn(self, *args, **kwargs):
         return TurnResult(
@@ -72,12 +96,68 @@ def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, t
         )
 
     monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
-    args = build_cli_parser().parse_args(["run", "--json", "--new", "solve /tmp/challenge"])
+    args = build_cli_parser().parse_args(["run", "--json", "solve /tmp/challenge"])
     asyncio.run(handle_run(args))
 
     output = json.loads(capsys.readouterr().out)
     assert output["lifecycle_status"] == "model_terminal"
     assert output["status"] == "terminal"
+
+
+def test_cli_named_resume_never_creates_a_missing_session(monkeypatch, tmp_path):
+    """Falling back to get_or_create here would silently join unrelated work."""
+    import asyncio
+    from gpt_cli.cli.main import handle_run
+    from gpt_cli.core.types import TokenBundle
+    from gpt_cli.session.registry import SessionLookupError
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+    args = build_cli_parser().parse_args(["run", "--resume-session", "sess_missing", "continue"])
+
+    with pytest.raises(SessionLookupError):
+        asyncio.run(handle_run(args))
+
+    assert SessionRegistry(tmp_path / "sessions").list_sessions() == []
+
+
+def test_cli_steer_routes_named_live_session_to_its_control_socket(monkeypatch, tmp_path, capsys):
+    """Changing CLI target resolution must not steer whichever turn happens to be newest."""
+    import asyncio
+    import json
+    from gpt_cli.cli.main import handle_steer
+    from gpt_cli.session.live_turns import LiveTurnRegistry, TurnOwner
+    from gpt_cli.session.turn_control import TurnControlServer
+
+    async def run() -> None:
+        sessions = tmp_path / "sessions"
+        runtime = tmp_path / "runtime"
+        monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", sessions)
+        monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: runtime)
+        registry = SessionRegistry(sessions)
+        registry.create_session(local_id="sess_one")
+        live_registry = LiveTurnRegistry(runtime)
+        owner = TurnOwner.create_for_current_process("sess_one", runtime / "turn.sock")
+        live_registry.claim(owner)
+
+        async def on_steer(request_id, prompt):
+            return {"status": "queued", "session_id": "sess_one", "message": prompt}
+
+        server = TurnControlServer(owner, live_registry, on_steer)
+        await server.start()
+        try:
+            args = build_cli_parser().parse_args(["steer", "--resume-session", "sess_one", "--json", "check logs"])
+            await handle_steer(args)
+        finally:
+            await server.close()
+            live_registry.release("sess_one", owner.owner_id)
+
+    asyncio.run(run())
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "queued", "session_id": "sess_one", "message": "check logs"
+    }
 
 
 def test_format_chat_messages_multi_turn():
@@ -532,25 +612,9 @@ def test_anthropic_non_streaming_stop_reason_end_turn_when_text_produced(monkeyp
     assert data["stop_reason"] == "end_turn"
     assert any(b.get("type") == "text" for b in data["content"])
 
-def test_cli_parser_newsession_command():
-    from gpt_cli.cli.main import build_cli_parser
+def test_cli_parser_keeps_session_new_as_the_only_metadata_creator():
     parser = build_cli_parser()
-
-    # Test top-level newsession
-    args = parser.parse_args(["newsession", "-t", "test-tag", "Hello world"])
-    assert args.command == "newsession"
-    assert args.tag == "test-tag"
-    assert args.pos_prompt == ["Hello world"]
-
-    # Test top-level new
-    args2 = parser.parse_args(["new", "-t", "test-tag-2"])
-    assert args2.command == "new"
-    assert args2.tag == "test-tag-2"
-
-    # Test session new
-    args3 = parser.parse_args(["session", "new", "-t", "sub-tag"])
-    assert args3.command == "session"
-    assert args3.session_action == "new"
-    assert args3.tag == "sub-tag"
-
-
+    args = parser.parse_args(["session", "new", "-t", "sub-tag"])
+    assert args.command == "session"
+    assert args.session_action == "new"
+    assert args.tag == "sub-tag"

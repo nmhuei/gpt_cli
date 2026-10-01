@@ -18,6 +18,21 @@ class TurnRequest:
     thinking_effort: str | None = None
     timeout_seconds: float = 60.0
 
+
+@dataclass(slots=True)
+class SteerContext:
+    """Protocol identities observed for one upstream async turn."""
+
+    conversation_id: str
+    parent_message_id: str
+    model: str
+    async_task_id: str
+    headers: dict[str, str]
+    async_task_turn_id: str | None = None
+    turn_trace_id: str | None = None
+    client_prepare_state: str = "none"
+    steer_turn_action: str = "continue"
+
 @dataclass(slots=True)
 class TurnResult:
     text: str

@@ -35,6 +35,12 @@ def test_resolve_prompt_default_bridge_without_mention():
     res = resolve_prompt_with_bridge(p, bridge_name="br")
     assert res == "@br solve https://test.lab"
 
+
+def test_resolve_prompt_binds_absolute_solve_path_for_br():
+    res = resolve_prompt_with_bridge("solve /tmp/challenge", bridge_name="br")
+    assert res == "@br host_workspace_bind path=/tmp/challenge; solve"
+    assert len(res.split()) <= 5
+
 def test_resolve_prompt_no_bridge_disabled():
     p = "hello world"
     res = resolve_prompt_with_bridge(p, bridge_name="none")

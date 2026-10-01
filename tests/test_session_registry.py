@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 from gpt_cli.session.models import SessionRecord
-from gpt_cli.session.registry import SessionRegistry
+from gpt_cli.session.registry import SessionLookupError, SessionRegistry
 
 def test_session_creation_and_continuity(tmp_path: Path):
     reg = SessionRegistry(storage_dir=tmp_path)
@@ -65,6 +65,25 @@ def test_session_persistence(tmp_path: Path):
     assert loaded is not None
     assert loaded.conversation_id == "conv_p1"
     assert loaded.last_message_id == "msg_p1"
+
+
+def test_require_session_rejects_missing_active_and_unknown_id(tmp_path: Path):
+    """Removing strict resume validation must fail this input-contract test."""
+    reg = SessionRegistry(storage_dir=tmp_path)
+
+    with pytest.raises(SessionLookupError, match="No active local session"):
+        reg.require_session(None)
+    with pytest.raises(SessionLookupError, match="sess_missing"):
+        reg.require_session("sess_missing")
+
+
+def test_require_session_returns_existing_active_or_named_session(tmp_path: Path):
+    """Resume resolution must never manufacture a local session."""
+    reg = SessionRegistry(storage_dir=tmp_path)
+    session = reg.create_session(local_id="sess_known")
+
+    assert reg.require_session(None).local_id == session.local_id
+    assert reg.require_session("sess_known").local_id == session.local_id
 
 
 def test_checkpoint_preserves_pointer_without_incrementing_completed_turns(tmp_path: Path):
