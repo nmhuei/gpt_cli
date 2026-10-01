@@ -61,6 +61,7 @@ gpt run --no-bridge "Trả lời thuần văn bản"
 
 # Xem danh sách session do tool tạo ra
 gpt session list --json
+gpt session new --tag "ctf:challenge-1" --json
 
 # Quản lý Gateway nền (cổng 18000)
 gpt start
