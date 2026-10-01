@@ -116,7 +116,9 @@ def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, t
     args = build_cli_parser().parse_args(["run", "--json", "solve /tmp/challenge"])
     asyncio.run(handle_run(args))
 
-    output = json.loads(capsys.readouterr().out)
+    rendered = capsys.readouterr().out
+    assert len(rendered.splitlines()) == 1
+    output = json.loads(rendered)
     assert output["lifecycle_status"] == "model_terminal"
     assert output["status"] == "terminal"
 

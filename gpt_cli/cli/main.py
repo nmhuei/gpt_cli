@@ -547,7 +547,7 @@ async def handle_run(args: argparse.Namespace) -> None:
             "duration_ms": result.duration_ms,
             "log_dir": str(log_mgr.session_dir(sess.local_id))
         }
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        print(json.dumps(out, ensure_ascii=False))
     else:
         if lifecycle_status != "completed_turn":
             sys.stdout.write(f"\n\033[33m⚠️ [Turn Lifecycle: {lifecycle_status}]\033[0m\n")
