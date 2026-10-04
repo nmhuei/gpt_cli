@@ -36,10 +36,25 @@ def test_resolve_prompt_default_bridge_without_mention():
     assert res == "@br solve https://test.lab"
 
 
-def test_resolve_prompt_binds_workspace_name_for_br():
-    res = resolve_prompt_with_bridge("solve /tmp/challenge", bridge_name="br")
-    assert res == "@br bind challenge; solve /tmp/challenge"
-    assert len(res.split()) <= 5
+def test_resolve_prompt_uses_web_app_reference_when_connector_is_attached():
+    """ChatGPT Web sends an app:// rich mention, not a plain @mention."""
+    res = resolve_prompt_with_bridge(
+        "@br hello",
+        bridge_name="br",
+        connector_id="asdk_app_br",
+    )
+
+    assert res == "[$br](app://asdk_app_br) hello"
+
+
+def test_resolve_prompt_preserves_br_solve_instruction_without_injected_bind():
+    res = resolve_prompt_with_bridge(
+        "solve /tmp/challenge",
+        bridge_name="br",
+        connector_id="asdk_app_br",
+    )
+    assert res == "[$br](app://asdk_app_br) solve /tmp/challenge"
+    assert "bind" not in res
 
 def test_resolve_prompt_no_bridge_disabled():
     p = "hello world"

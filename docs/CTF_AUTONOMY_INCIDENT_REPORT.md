@@ -38,7 +38,7 @@ connector source is propagated.
 
 ### INC-002 — compact `solve <path>` discarded the challenge path
 
-**Observed:** The `br` shortcut became `@br bind Chrono_II; solve`; the model
+**Historical observation:** The `br` shortcut became `@br bind Chrono_II; solve`; the model
 bound the workspace but correctly asked the user to supply the challenge
 input.
 
@@ -46,10 +46,12 @@ input.
 choose the BQA workspace, then dropped the absolute challenge path that the
 solver needs.
 
-**Fix:** `a6f70ef` keeps the compact imperative command while sending
-`@br bind <workspace>; solve <absolute-path>`.
+**Resolution:** The rewrite has been removed. The CLI preserves
+`solve <absolute-path>` exactly after its native app reference; selecting BR
+does not add `bind`, `continue`, or another hidden instruction.
 
-**Verification:** `tests/test_bridge_resolution.py` passes all 13 tests.
+**Verification:** `tests/test_bridge_resolution.py` verifies the exact prompt
+preservation rule.
 
 ## Investigated observations — not defects
 

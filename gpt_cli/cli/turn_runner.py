@@ -37,6 +37,7 @@ class SessionTurnRunner:
         effort: str,
         transport_factory: Callable[[TokenBundle], Any] = WireTransport,
         emit_event: EventSink | None = None,
+        capture_images: bool = False,
     ):
         self.registry = registry
         self.live_registry = live_registry
@@ -47,6 +48,7 @@ class SessionTurnRunner:
         self.effort = effort
         self.transport_factory = transport_factory
         self.emit_event = emit_event
+        self.capture_images = capture_images
         self._owner: TurnOwner | None = None
         self._control: TurnControlServer | None = None
         self._transport: Any | None = None
@@ -257,6 +259,8 @@ class SessionTurnRunner:
             send_args["system_hints"] = self._system_hints
         if self._selected_mcp_sources:
             send_args["selected_mcp_sources"] = self._selected_mcp_sources
+        if self.capture_images:
+            send_args["capture_images"] = True
         result = await self._transport.send_turn(
             **send_args,
         )

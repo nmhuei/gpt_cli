@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 import sys
 import time
 import uuid
@@ -18,6 +19,7 @@ from ..session.turn_control import request_steer
 from ..transport.wire import WireTransport
 from ..server.daemon import start_daemon, stop_daemon, status_daemon
 from ..telemetry.presenter import TerminalTelemetryPresenter
+from ..plugins.manager import PluginManager, PluginInfo
 from .turn_runner import SessionTurnRunner
 
 def build_cli_parser() -> argparse.ArgumentParser:
@@ -35,7 +37,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     run_p.add_argument("pos_prompt", nargs="*", default=[], help="Positional prompt text")
     run_resume = run_p.add_mutually_exclusive_group()
     run_resume.add_argument("--resume", action="store_true", help="Continue the active local session")
-    run_resume.add_argument("--resume-session", default=None, help="Continue an existing local session ID")
+    run_resume.add_argument("-s", "--resume-session", "--session", "--sesion", default=None, help="Continue an existing local session ID")
     run_resume.add_argument("--conversation", default=None, help="Attach a ChatGPT Web conversation UUID")
     run_p.add_argument("-t", "--tag", default=None, help="Tag for the session")
     run_p.add_argument("-m", "--model", default=settings.default_model, help="Model alias")
@@ -44,11 +46,37 @@ def build_cli_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
     run_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
+    # 1b. agent: a bounded continuous session for work that must not end after
+    # a single conversational response.  Keep ordinary `run` one-shot.
+    agent_p = subparsers.add_parser("agent", help="Run one continuous agent session")
+    agent_p.add_argument("-p", "--prompt", default=None, help="Initial task prompt")
+    agent_p.add_argument("pos_prompt", nargs="*", default=[], help="Initial task prompt")
+    agent_resume = agent_p.add_mutually_exclusive_group()
+    agent_resume.add_argument("--resume", action="store_true", help="Continue the active local session")
+    agent_resume.add_argument("-s", "--resume-session", "--session", "--sesion", default=None, help="Continue an existing local session ID")
+    agent_resume.add_argument("--conversation", default=None, help="Attach a ChatGPT Web conversation UUID")
+    agent_p.add_argument("-t", "--tag", default=None, help="Tag for the session")
+    agent_p.add_argument("-m", "--model", default=settings.default_model, help="Model alias")
+    agent_p.add_argument("-e", "--effort", default=settings.default_effort, help="Thinking effort")
+    agent_p.add_argument("-b", "--bridge", default=None, help=f"Active MCP bridge/connector name (default: {settings.default_bridge_name})")
+    agent_p.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
+    agent_p.add_argument(
+        "--min-runtime-minutes", type=float, default=30.0,
+        help="Minimum accumulated upstream turn duration for this session (default: 30)",
+    )
+    agent_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
+    # Image generation remains a normal conversation turn, but has a focused
+    # command and automatically downloads generated image artifacts.
+    image_p = subparsers.add_parser("image", help="Generate and save an image")
+    image_p.add_argument("-p", "--prompt", required=True, help="Image description")
+    image_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
     # 2. chat (interactive)
     chat_p = subparsers.add_parser("chat", help="Start interactive terminal chat session")
     chat_resume = chat_p.add_mutually_exclusive_group()
     chat_resume.add_argument("--resume", action="store_true", help="Continue the active local session")
-    chat_resume.add_argument("--resume-session", default=None, help="Continue an existing local session ID")
+    chat_resume.add_argument("-s", "--resume-session", "--session", "--sesion", default=None, help="Continue an existing local session ID")
     chat_resume.add_argument("--conversation", default=None, help="Attach a ChatGPT Web conversation UUID")
     chat_p.add_argument("-m", "--model", default=settings.default_model, help="Model alias")
     chat_p.add_argument("-b", "--bridge", default=None, help=f"Active MCP bridge/connector name (default: {settings.default_bridge_name})")
@@ -92,12 +120,37 @@ def build_cli_parser() -> argparse.ArgumentParser:
     steer_p = subparsers.add_parser("steer", help="Add an instruction to one running local session")
     steer_resume = steer_p.add_mutually_exclusive_group()
     steer_resume.add_argument("--resume", action="store_true", help="Target the active local session")
-    steer_resume.add_argument("--resume-session", default=None, help="Target a specific running local session")
+    steer_resume.add_argument("-s", "--resume-session", "--session", "--sesion", default=None, help="Target a specific running local session")
     steer_p.add_argument("-p", "--prompt", default=None, help="Steering instruction")
     steer_p.add_argument("pos_prompt", nargs="*", default=[], help="Steering instruction")
     steer_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
-    # 5. Gateway control
+    # 5. Connected ChatGPT Web MCP apps
+    plugin_p = subparsers.add_parser("plugin", help="Manage connected MCP plugins")
+    plugin_sub = plugin_p.add_subparsers(dest="plugin_action", required=True)
+    plugin_list_p = plugin_sub.add_parser("list", help="List connected MCP plugins")
+    plugin_list_p.add_argument("--json", action="store_true", help="Output JSON")
+    plugin_add_p = plugin_sub.add_parser("add", help="Create, connect, and authorize a no-auth MCP plugin")
+    plugin_add_p.add_argument("name", help="Name shown in ChatGPT, for example br")
+    plugin_add_p.add_argument("mcp_url", help="MCP server URL")
+    plugin_add_p.add_argument("--description", default="", help="Optional connector description")
+    plugin_add_p.add_argument(
+        "--permission", default="full_access",
+        choices=("full_access", "low_risk", "read_only", "always_ask"),
+        help="ChatGPT app permission after connecting (default: full_access)",
+    )
+    plugin_add_p.add_argument("--json", action="store_true", help="Output JSON")
+    plugin_permission_p = plugin_sub.add_parser("permission", help="Change a connected plugin permission")
+    plugin_permission_p.add_argument("identifier", help="Plugin name, link ID, or connector ID")
+    plugin_permission_p.add_argument(
+        "permission", choices=("full_access", "low_risk", "read_only", "always_ask"),
+    )
+    plugin_permission_p.add_argument("--json", action="store_true", help="Output JSON")
+    plugin_remove_p = plugin_sub.add_parser("remove", help="Explicitly remove a plugin link and connector")
+    plugin_remove_p.add_argument("identifier", help="Plugin name, link ID, or connector ID")
+    plugin_remove_p.add_argument("--json", action="store_true", help="Output JSON")
+
+    # 6. Gateway control
     start_p = subparsers.add_parser("start", help="Start gateway daemon")
     start_p.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
     start_p.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
@@ -120,8 +173,7 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
     local session unless an explicit resume flag is supplied.
     """
     parser = build_cli_parser()
-    run_shortcut_options = {"-b", "--bridge", "-p", "--prompt", "--no-bridge", "--json"}
-    if argv and argv[0] in run_shortcut_options:
+    if argv and argv[0].startswith("-") and argv[0] not in {"-h", "--help"}:
         return parser.parse_args(["run", *argv])
     return parser.parse_args(argv)
 
@@ -256,7 +308,16 @@ async def interactive_chat(
                     sys.stdout.write(f"\n\033[33m📚 Sources:\n{c_lines}\033[0m\n")
                     sys.stdout.flush()
 
-        wire_prompt = resolve_prompt_with_bridge(user_input, active_bridge)
+        system_hints, selected_mcp_sources = (
+            await asyncio.to_thread(resolve_connector_context, active_bridge)
+            if active_bridge
+            else ([], [])
+        )
+        wire_prompt = resolve_prompt_with_bridge(
+            user_input,
+            active_bridge,
+            connector_id=system_hints[0] if system_hints else None,
+        )
         try:
             runner = SessionTurnRunner(
                 registry=reg,
@@ -268,18 +329,27 @@ async def interactive_chat(
                 effort="extended",
                 emit_event=on_event,
             )
-            result = await runner.run_initial(wire_prompt)
+            result = await runner.run_initial(
+                wire_prompt,
+                system_hints=system_hints,
+                selected_mcp_sources=selected_mcp_sources,
+            )
+            for image_path in result.image_paths:
+                print(f"🖼️ Image saved: {image_path}")
+            for image_error in result.image_errors:
+                print(f"⚠️ Image download failed: {image_error}", file=sys.stderr)
             sys.stdout.write("\n\n")
             sys.stdout.flush()
             sess = reg.get_session(sess.local_id) or sess
         except Exception as e:
             print(f"\nError: {e}\n", file=sys.stderr)
 
-async def handle_run(args: argparse.Namespace) -> None:
+async def handle_run(args: argparse.Namespace):
+    quiet = bool(getattr(args, "quiet", False))
     cache_mgr = TokenCacheManager()
     bundle = cache_mgr.load_disk_cache()
     if not bundle:
-        if getattr(args, "json", False):
+        if getattr(args, "json", False) and not quiet:
             print(json.dumps({"status": "error", "message": "No valid token bundle found in disk cache"}))
         else:
             print("Error: No token bundle found in cache (~/.local/share/webgpt/profiles/personal).", file=sys.stderr)
@@ -306,10 +376,10 @@ async def handle_run(args: argparse.Namespace) -> None:
                     sess = reg.create_session(tag=f"web:{title[:20]}")
                     reg.update_turn(sess.local_id, conversation_id=conv_id, last_message_id=curr_node, model=getattr(args, "model", "gpt-5-6-thinking"))
                     sess = reg.get_session(sess.local_id) or sess
-                    if not getattr(args, "json", False):
+                    if not getattr(args, "json", False) and not quiet:
                         print(f"Attached to ChatGPT Web thread: '{title}' ({conv_id})\n")
         except Exception as e:
-            if not getattr(args, "json", False):
+            if not getattr(args, "json", False) and not quiet:
                 print(f"Warning: Failed to attach web conversation: {e}\n", file=sys.stderr)
 
     if not sess:
@@ -328,26 +398,30 @@ async def handle_run(args: argparse.Namespace) -> None:
     if not raw_prompt and not sys.stdin.isatty():
         raw_prompt = sys.stdin.read().strip()
     if not raw_prompt:
-        if getattr(args, "json", False):
+        if getattr(args, "json", False) and not quiet:
             print(json.dumps({"status": "error", "message": "Prompt is required"}))
         else:
             print("Error: Prompt is required. Example: `gpt \"Hello\"` or `gpt run \"Your task\"`", file=sys.stderr)
         sys.exit(2)
 
     active_bridge: str | None = None if getattr(args, "no_bridge", False) else (getattr(args, "bridge", None) or settings.default_bridge_name)
+    if not active_bridge and not getattr(args, "no_bridge", False):
+        m = re.match(r"^@\[?([a-zA-Z0-9_\-]+)\]?", raw_prompt)
+        if m:
+            active_bridge = m.group(1)
 
     turn_number = sess.turns + 1
     captured_thoughts: list[str] = []
     captured_tools: list[dict[str, Any]] = []
     printed_telemetry: set[str] = set()
-    presenter = None if getattr(args, "json", False) else TerminalTelemetryPresenter(sys.stdout)
+    presenter = None if getattr(args, "json", False) or quiet else TerminalTelemetryPresenter(sys.stdout)
     checkpoint_conversation_id = sess.conversation_id
     checkpoint_message_id = sess.last_message_id
     printed_any_delta = False
 
     def on_event(ev):
         nonlocal checkpoint_conversation_id, checkpoint_message_id, printed_any_delta
-        is_json = getattr(args, "json", False)
+        is_json = getattr(args, "json", False) or quiet
 
         if ev.event_type == "conversation_id":
             checkpoint_conversation_id = ev.data.get("conversation_id") or checkpoint_conversation_id
@@ -407,11 +481,22 @@ async def handle_run(args: argparse.Namespace) -> None:
                 sys.stdout.write(f"\n\033[33m📚 Sources:\n{c_lines}\033[0m\n")
                 sys.stdout.flush()
 
-    wire_prompt = resolve_prompt_with_bridge(raw_prompt, active_bridge)
+    has_explicit_bridge = bool(getattr(args, "bridge", None))
+    if not has_explicit_bridge and not getattr(args, "no_bridge", False):
+        m = re.match(r"^@\[?([a-zA-Z0-9_\-]+)\]?", raw_prompt)
+        if m:
+            has_explicit_bridge = True
+            active_bridge = m.group(1)
+
     system_hints, selected_mcp_sources = (
         await asyncio.to_thread(resolve_connector_context, active_bridge)
-        if getattr(args, "bridge", None) and active_bridge
+        if has_explicit_bridge and active_bridge and not getattr(args, "no_bridge", False)
         else ([], [])
+    )
+    wire_prompt = resolve_prompt_with_bridge(
+        raw_prompt,
+        active_bridge,
+        connector_id=system_hints[0] if system_hints else None,
     )
 
     last_event_time = time.monotonic()
@@ -424,7 +509,7 @@ async def handle_run(args: argparse.Namespace) -> None:
         while True:
             await asyncio.sleep(20)
             if time.monotonic() - last_event_time >= 20:
-                if not getattr(args, "json", False):
+                if not getattr(args, "json", False) and not quiet:
                     sys.stdout.write("\033[2m⏱️ [Conduit Heartbeat] Model/tool operation in progress...\033[0m\n")
                     sys.stdout.flush()
 
@@ -440,6 +525,7 @@ async def handle_run(args: argparse.Namespace) -> None:
             model=getattr(args, "model", "gpt-5-6-thinking"),
             effort=getattr(args, "effort", "extended"),
             emit_event=on_event_with_timer,
+            capture_images=bool(getattr(args, "capture_images", False)),
         )
         result = await runner.run_initial(
             wire_prompt,
@@ -448,7 +534,7 @@ async def handle_run(args: argparse.Namespace) -> None:
         )
         sess = reg.require_session(sess.local_id)
     except KeyboardInterrupt:
-        if not getattr(args, "json", False):
+        if not getattr(args, "json", False) and not quiet:
             sys.stdout.write(f"\n\n\033[1;33m⏸️ [Interrupted by User] Session saved: {sess.local_id}\033[0m\n")
             sys.stdout.write(f"\033[2mTo resume at any time, run:\n  gpt run --resume-session {sess.local_id}\033[0m\n\n")
             sys.stdout.flush()
@@ -483,7 +569,7 @@ async def handle_run(args: argparse.Namespace) -> None:
         "model_terminal": "terminal",
     }.get(lifecycle_status, "incomplete")
 
-    if getattr(args, "json", False):
+    if getattr(args, "json", False) and not quiet:
         out = {
             "status": output_status,
             "lifecycle_status": lifecycle_status,
@@ -495,14 +581,22 @@ async def handle_run(args: argparse.Namespace) -> None:
             "bqa_workspace_path": sess.bqa_workspace_path,
             "model": result.model,
             "duration_ms": result.duration_ms,
+            "thinking": captured_thoughts,
+            "tool_calls": captured_tools,
+            "image_paths": result.image_paths,
+            "image_errors": result.image_errors,
             "error": result.error,
             "log_dir": str(log_mgr.session_dir(sess.local_id))
         }
         print(json.dumps(out, ensure_ascii=False))
-    else:
+    elif not quiet:
         if not printed_any_delta and result.text:
             sys.stdout.write(result.text)
             sys.stdout.flush()
+        for image_path in result.image_paths:
+            sys.stdout.write(f"🖼️ Image saved: {image_path}\n")
+        for image_error in result.image_errors:
+            sys.stderr.write(f"⚠️ Image download failed: {image_error}\n")
         if lifecycle_status != "completed_turn":
             sys.stdout.write(f"\n\033[33m⚠️ [Turn Lifecycle: {lifecycle_status}]\033[0m\n")
             if result.error:
@@ -512,6 +606,125 @@ async def handle_run(args: argparse.Namespace) -> None:
         else:
             sys.stdout.write("\n\n")
             sys.stdout.flush()
+
+    return result
+
+
+async def handle_image(args: argparse.Namespace) -> None:
+    """Run one fresh image-focused turn and require a downloaded image artifact."""
+    prompt = f"Create an image using the image-generation tool for this description:\n\n{args.prompt}"
+    run_args = argparse.Namespace(**vars(args))
+    run_args.command = "run"
+    run_args.prompt = prompt
+    run_args.pos_prompt = []
+    run_args.resume = False
+    run_args.resume_session = None
+    run_args.conversation = None
+    run_args.tag = "image"
+    run_args.bridge = None
+    run_args.no_bridge = True
+    run_args.quiet = True
+    run_args.capture_images = True
+    result = await handle_run(run_args)
+
+    if not result.image_paths:
+        message = "No image artifact was returned by the image-generation tool."
+        if result.image_errors:
+            message += " " + "; ".join(result.image_errors)
+        if args.json:
+            print(json.dumps({
+                "status": "error",
+                "message": message,
+                "image_paths": [],
+                "image_errors": result.image_errors,
+                "conversation_id": result.conversation_id,
+            }, ensure_ascii=False))
+        else:
+            print(message, file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.json:
+        print(json.dumps({
+            "status": "ok",
+            "image_paths": result.image_paths,
+            "image_errors": result.image_errors,
+            "conversation_id": result.conversation_id,
+            "message_id": result.message_id,
+        }, ensure_ascii=False))
+    else:
+        for image_path in result.image_paths:
+            print(f"🖼️ Image saved: {image_path}")
+        for image_error in result.image_errors:
+            print(f"⚠️ Image download failed: {image_error}", file=sys.stderr)
+
+
+async def handle_agent(args: argparse.Namespace) -> None:
+    """Keep a single server-side DAG active until its measured runtime budget is met.
+
+    ChatGPT decides whether one individual turn is terminal.  The CLI cannot
+    inspect hidden reasoning, so an agent run deliberately measures the
+    provider-visible upstream duration and creates ordinary follow-up turns
+    from the latest durable parent node when a turn ends early.
+    """
+    if args.min_runtime_minutes <= 0:
+        raise ValueError("--min-runtime-minutes must be greater than zero")
+    if args.json:
+        # The agent owns JSON stdout; individual internal turns stay in logs.
+        args.quiet = True
+
+    registry = SessionRegistry()
+    baseline_turns = 0
+    if getattr(args, "resume_session", None):
+        baseline_turns = registry.require_session(args.resume_session).turns
+    elif getattr(args, "resume", False):
+        baseline_turns = registry.require_session(None).turns
+
+    target_ms = int(args.min_runtime_minutes * 60_000)
+    original_prompt = args.prompt
+    original_parts = list(args.pos_prompt)
+    await handle_run(args)
+
+    session = SessionRegistry().require_session(None)
+    log_manager = SessionLogManager()
+
+    def elapsed_ms() -> int:
+        history = log_manager.get_history(session.local_id)
+        return sum(int(item.get("duration_ms") or 0) for item in history[baseline_turns:])
+
+    elapsed = elapsed_ms()
+    while elapsed < target_ms:
+        if not args.json:
+            sys.stdout.write(
+                f"\033[2m🤖 Agent continuing in {session.local_id} "
+                f"({elapsed / 60_000:.1f}/{args.min_runtime_minutes:.1f} min)…\033[0m\n"
+            )
+            sys.stdout.flush()
+
+        continuation = argparse.Namespace(**vars(args))
+        continuation.command = "run"
+        continuation.prompt = "continue"
+        continuation.pos_prompt = []
+        continuation.resume = False
+        continuation.resume_session = session.local_id
+        continuation.conversation = None
+        await handle_run(continuation)
+        session = SessionRegistry().require_session(session.local_id)
+        elapsed = elapsed_ms()
+
+    if args.json:
+        print(json.dumps({
+            "status": "runtime_target_reached",
+            "session_id": session.local_id,
+            "runtime_duration_ms": elapsed,
+            "target_duration_ms": target_ms,
+        }, ensure_ascii=False))
+    else:
+        sys.stdout.write(
+            f"\033[32m✓ Agent runtime target reached: {elapsed / 60_000:.1f}/"
+            f"{args.min_runtime_minutes:.1f} min in {session.local_id}\033[0m\n"
+        )
+        sys.stdout.flush()
+
 
 async def handle_steer(args: argparse.Namespace) -> None:
     raw_prompt = getattr(args, "prompt", None) or " ".join(getattr(args, "pos_prompt", [])).strip()
@@ -656,8 +869,76 @@ def handle_session(args: argparse.Namespace) -> None:
             print(f"Session {args.session_id} not found.", file=sys.stderr)
             sys.exit(1)
 
+
+def _plugin_output(plugin: PluginInfo, status: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "name": plugin.name,
+        "connector_id": plugin.connector_id,
+        "link_id": plugin.link_id,
+        "auth_status": plugin.auth_status,
+        "permission": plugin.apps_privacy_control,
+        "actions": plugin.actions,
+    }
+
+
+def handle_plugin(args: argparse.Namespace) -> None:
+    manager = PluginManager()
+    if args.plugin_action == "list":
+        plugins = manager.list_plugins()
+        out = {"plugins": [_plugin_output(plugin, "connected") for plugin in plugins]}
+        if args.json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        elif not plugins:
+            print("No connected MCP plugins.")
+        else:
+            for plugin in plugins:
+                print(
+                    f"{plugin.name}: {plugin.auth_status}, {plugin.apps_privacy_control}, "
+                    f"{len(plugin.actions)} actions\n  connector={plugin.connector_id}\n  link={plugin.link_id}"
+                )
+        return
+
+    if args.plugin_action == "add":
+        plugin = manager.add_mcp_plugin(
+            name=args.name,
+            mcp_url=args.mcp_url,
+            description=args.description,
+            permission=args.permission,
+        )
+        out = _plugin_output(plugin, "added")
+    elif args.plugin_action == "permission":
+        plugin = manager.set_permission(args.identifier, args.permission)
+        out = _plugin_output(plugin, "permission_updated")
+    elif args.plugin_action == "remove":
+        result = manager.delete_plugin(args.identifier)
+        out = {
+            "status": "removed" if result.success else "remove_failed",
+            "identifier": result.identifier,
+            "link_deleted": result.link_deleted,
+            "connector_deleted": result.connector_deleted,
+            "error": result.error,
+        }
+        if not result.success:
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False))
+            raise SystemExit(1)
+    else:
+        raise ValueError(f"Unknown plugin action: {args.plugin_action}")
+
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(
+            f"{out['status']}: {out['name']}\n"
+            f"  connector={out['connector_id']}\n"
+            f"  link={out['link_id']}\n"
+            f"  permission={out['permission']}\n"
+            f"  actions={len(out['actions'])}"
+        )
+
 def main() -> None:
-    known_commands = {"run", "chat", "steer", "session", "start", "stop", "restart", "status", "-h", "--help"}
+    known_commands = {"run", "agent", "image", "chat", "steer", "session", "plugin", "start", "stop", "restart", "status", "-h", "--help"}
     if len(sys.argv) == 1:
         asyncio.run(interactive_chat())
         return
@@ -681,6 +962,10 @@ def main() -> None:
         sys.exit(0)
     if args.command == "run":
         asyncio.run(handle_run(args))
+    elif args.command == "agent":
+        asyncio.run(handle_agent(args))
+    elif args.command == "image":
+        asyncio.run(handle_image(args))
     elif args.command == "chat":
         asyncio.run(interactive_chat(
             model=args.model,
@@ -694,6 +979,8 @@ def main() -> None:
         asyncio.run(handle_steer(args))
     elif args.command == "session":
         handle_session(args)
+    elif args.command == "plugin":
+        handle_plugin(args)
     elif args.command == "start":
         start_daemon(host=args.host, port=args.port)
     elif args.command == "stop":

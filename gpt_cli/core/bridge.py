@@ -20,12 +20,23 @@ def resolve_connector_system_hints(connector_name: str | None) -> list[str]:
     """Compatibility helper for callers that only need prepare-time hints."""
     return resolve_connector_context(connector_name)[0]
 
-def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> str:
+def resolve_prompt_with_bridge(
+    prompt: str,
+    bridge_name: str | None = None,
+    connector_id: str | None = None,
+) -> str:
     """
-    Resolve an explicit connector mention into ChatGPT's native mention syntax.
+    Resolve an explicit connector mention into ChatGPT Web's native syntax.
+
+    The Web composer encodes an attached app as ``[$name](app://connector_id)``.
+    A plain ``@name`` is retained only when no live connector has been resolved.
     """
     p = prompt.strip()
     if not p:
+        return p
+
+    # Preserve a rich app reference copied from ChatGPT Web without nesting it.
+    if re.match(r"^\[\$[a-zA-Z0-9_\-]+\]\(app://[^)]+\)(?:\s|$)", p):
         return p
 
     legacy_match = re.match(
@@ -56,14 +67,5 @@ def resolve_prompt_with_bridge(prompt: str, bridge_name: str | None = None) -> s
             return p
         clean_prompt = p
 
-    # Keep the compact CLI form, but ask the connector to bind by its workspace
-    solve_match = re.match(r"^solve\s+(/\S+)(?:\s+(.*))?$", clean_prompt, re.DOTALL)
-    if target_bridge == "br" and solve_match:
-        challenge_path = solve_match.group(1)
-        extra_prompt = (solve_match.group(2) or "").strip()
-        workspace_name = challenge_path.rstrip("/").rsplit("/", 1)[-1]
-        bind_prefix = f"@br bind {workspace_name}; solve {challenge_path}"
-        return f"{bind_prefix} {extra_prompt}" if extra_prompt else bind_prefix
-
-    return f"@{target_bridge}" + (f" {clean_prompt}" if clean_prompt else "")
-
+    prefix = f"[${target_bridge}](app://{connector_id})" if connector_id else f"@{target_bridge}"
+    return prefix + (f" {clean_prompt}" if clean_prompt else "")

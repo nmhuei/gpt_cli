@@ -59,6 +59,10 @@ gpt steer --resume-session sess_8f3a12 --json "Không sửa file cấu hình"
 gpt run --bridge br "Kiểm tra dịch vụ"
 gpt run --no-bridge "Trả lời thuần văn bản"
 
+# Tạo ảnh và tự lưu artifact vào ~/Pictures/gpt-images/
+gpt image -p "A blue bird perched on a moonlit branch"
+gpt image -p "A blue bird perched on a moonlit branch" --json
+
 # Xem danh sách session do tool tạo ra
 gpt session list --json
 gpt session new --tag "ctf:challenge-1" --json

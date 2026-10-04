@@ -131,6 +131,7 @@ class WireTransport:
         system_hints: list[str] | None = None,
         selected_mcp_sources: list[dict[str, Any]] | None = None,
         on_event: Callable[[Any], None] | None = None,
+        capture_images: bool = False,
     ) -> TurnResult:
         model_def = ModelRegistry.resolve(model_alias)
         t0 = time.perf_counter()
@@ -209,6 +210,11 @@ class WireTransport:
         anonymous_tool_calls = 0
         stream_err: Exception | None = None
         observed_events: list[Any] = []
+        image_assets: dict[str, dict[str, object]] = {}
+        image_errors: list[str] = []
+        dag_state = None
+        recovery_client = None
+        fresh_image_turn = capture_images and conversation_id is None
 
         from ..telemetry.parser import SSETelemetryParser
         parser = SSETelemetryParser()
@@ -239,6 +245,10 @@ class WireTransport:
                     pending_tool_ids.discard(tool_id)
                 elif anonymous_tool_calls:
                     anonymous_tool_calls -= 1
+            elif ev.event_type == "image_artifact":
+                pointer = ev.data.get("asset_pointer")
+                if isinstance(pointer, str) and pointer:
+                    image_assets[pointer] = dict(ev.data)
             elif ev.event_type == "error":
                 stream_err = RuntimeError(f"Upstream SSE error: {ev.data.get('error')}")
             elif ev.event_type == "done":
@@ -302,14 +312,15 @@ class WireTransport:
             from .conversation import ConversationRecovery
             from .lifecycle import classify_lifecycle
 
-            recovery = ConversationRecovery(
+            recovery_client = ConversationRecovery(
                 self.bundle, session=self.session, user_agent=self.user_agent
             )
             try:
                 # Poll DAG until settled on the backend (inference worker may still be generating)
-                dag_state = await recovery.fetch_settled(
+                dag_state = await recovery_client.fetch_settled(
                     captured_conv_id,
                     expected_user_message_id=request_message_id,
+                    allow_current_branch=fresh_image_turn,
                 )
                 recovered_completed_answer = (
                     (stream_err is not None or not is_done)
@@ -328,10 +339,59 @@ class WireTransport:
                     stream_err = None
                     lifecycle_status = "completed_turn"
                 else:
+                    for event in getattr(dag_state, "timeline", ()):
+                        if getattr(event, "event_type", None) == "image_artifact":
+                            consume_event(event)
                     lifecycle_status = classify_lifecycle(observed_events, dag_state).value
             except Exception as recovery_error:
                 if stream_err is None:
                     stream_err = recovery_error
+
+        # Some image artifacts are present only in the settled conversation DAG,
+        # even when the SSE turn itself completed cleanly. Fetch that DAG only for
+        # the dedicated image command to avoid adding a request to normal chat.
+        if capture_images and not image_assets and captured_conv_id:
+            try:
+                if recovery_client is None:
+                    from .conversation import ConversationRecovery
+
+                    recovery_client = ConversationRecovery(
+                        self.bundle, session=self.session, user_agent=self.user_agent
+                    )
+                if fresh_image_turn:
+                    dag_state = await recovery_client.fetch_until_image_artifact(
+                        captured_conv_id,
+                        expected_user_message_id=request_message_id,
+                    )
+                elif dag_state is None:
+                    dag_state = await recovery_client.fetch(
+                        captured_conv_id,
+                        expected_user_message_id=request_message_id,
+                    )
+                if dag_state.matches_expected_message is True or fresh_image_turn:
+                    for event in dag_state.timeline:
+                        if event.event_type == "image_artifact":
+                            consume_event(event)
+            except Exception as artifact_error:
+                image_errors.append(f"Could not inspect the conversation for image artifacts: {artifact_error}")
+
+        if image_assets:
+            from .image_assets import download_image_asset
+
+            image_paths: list[str] = []
+            for asset in image_assets.values():
+                try:
+                    image_path = await download_image_asset(
+                        self.session,
+                        self.bundle,
+                        asset,
+                        user_agent=self.user_agent,
+                    )
+                    image_paths.append(str(image_path))
+                except Exception as download_error:
+                    image_errors.append(str(download_error))
+        else:
+            image_paths = []
 
         if lifecycle_status is None:
             from .lifecycle import classify_lifecycle
@@ -365,6 +425,8 @@ class WireTransport:
             status=turn_status,
             error=str(stream_err) if stream_err else None,
             lifecycle_status=lifecycle_status,
+            image_paths=image_paths,
+            image_errors=image_errors,
         )
 
     async def send_turn(
@@ -378,6 +440,7 @@ class WireTransport:
         selected_mcp_sources: list[dict[str, Any]] | None = None,
         on_event: Callable[[Any], None] | None = None,
         max_retries: int = 5,
+        capture_images: bool = False,
     ) -> TurnResult:
         last_err: Exception | None = None
         for attempt in range(max_retries):
@@ -407,7 +470,7 @@ class WireTransport:
                     on_event(event)
 
             try:
-                res = await self._send_once(
+                send_args = dict(
                     prompt=prompt,
                     conversation_id=conversation_id,
                     parent_id=parent_id,
@@ -417,6 +480,9 @@ class WireTransport:
                     selected_mcp_sources=selected_mcp_sources,
                     on_event=observe_event,
                 )
+                if capture_images:
+                    send_args["capture_images"] = True
+                res = await self._send_once(**send_args)
                 if is_upstream_rejection(res.error):
                     self.admission.record_rejection(res.error)
                 # If incomplete, stream has already delivered partial progress; do not auto-replay prompt

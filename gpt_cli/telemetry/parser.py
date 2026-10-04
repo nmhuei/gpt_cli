@@ -37,6 +37,40 @@ class SSETelemetryParser:
         self._current_content_type: str | None = None
         self._active_tool_calls: dict[str, str] = {}
         self._last_async_task_key: tuple[str, str | None] | None = None
+        self._image_asset_pointers: set[str] = set()
+
+    def _image_artifact_events(self, message: dict[str, Any]) -> list[TelemetryEvent]:
+        author = message.get("author") or {}
+        if not isinstance(author, dict) or author.get("role") != "tool":
+            return []
+        content = message.get("content") or {}
+        if not isinstance(content, dict):
+            return []
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            return []
+        events = []
+        for part in parts:
+            if not isinstance(part, dict) or part.get("content_type") != "image_asset_pointer":
+                continue
+            pointer = part.get("asset_pointer")
+            mime_type = part.get("mime_type")
+            if not isinstance(pointer, str) or not pointer or not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+                continue
+            if pointer in self._image_asset_pointers:
+                continue
+            self._image_asset_pointers.add(pointer)
+            data: dict[str, Any] = {
+                "id": pointer,
+                "asset_pointer": pointer,
+                "mime_type": mime_type,
+            }
+            for key in ("width", "height", "size_bytes"):
+                value = part.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    data[key] = value
+            events.append(TelemetryEvent("image_artifact", data))
+        return events
 
     @staticmethod
     def _reference_id(message: dict[str, Any], metadata: dict[str, Any]) -> str | None:
@@ -151,6 +185,17 @@ class SSETelemetryParser:
             if isinstance(target, dict) and "message" in target:
                 payload = target
 
+            snapshot_message = payload.get("message")
+            if isinstance(snapshot_message, dict):
+                events.extend(self._image_artifact_events(snapshot_message))
+            elif isinstance(target, dict) and target.get("content_type") == "image_asset_pointer" and self._current_role == "tool":
+                # V1 patch streams can append a multimodal part without repeating
+                # the enclosing tool message snapshot.
+                events.extend(self._image_artifact_events({
+                    "author": {"role": "tool"},
+                    "content": {"parts": [target]},
+                }))
+
             # Check if path targets thoughts/reasoning
             if "thought" in path.lower() or "reasoning" in path.lower():
                 if isinstance(target, list):
@@ -188,6 +233,16 @@ class SSETelemetryParser:
                             events.append(TelemetryEvent(event_type="thinking", data={"thoughts": [v]}))
                         elif isinstance(v, str) and v.strip():
                             events.append(TelemetryEvent(event_type="thinking", data={"thoughts": [{"summary": v}]}))
+                        continue
+                    if (
+                        "/message/content/parts" in item_path
+                        and isinstance(item.get("v"), dict)
+                        and self._current_role == "tool"
+                    ):
+                        events.extend(self._image_artifact_events({
+                            "author": {"role": "tool"},
+                            "content": {"parts": [item["v"]]},
+                        }))
                         continue
                     if item_path == V1_PARTS_PATH and item.get("o") == "append" and isinstance(item.get("v"), str):
                         if self._current_content_type == "thoughts":

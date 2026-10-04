@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -58,18 +59,80 @@ class PluginManager:
                 "Please run interactive browser login or refresh credentials."
             )
         self.base_url = defaults.CHATGPT_BASE_URL
+        if self.cache_mgr.is_token_expired(self.bundle.access_token):
+            self.bundle = self._refresh_expired_bundle()
+
+        self._session: requests.Session | None = None
+        self._configure_auth(self.bundle)
+
+    def _refresh_expired_bundle(self):
+        """Refresh an expired cached token from the authenticated browser profile."""
+        try:
+            from ..transport.lifebuoy import BrowserLifebuoy
+
+            bundle = asyncio.run(
+                BrowserLifebuoy(self.cache_mgr).remint_credentials(headless=True)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Cached ChatGPT token expired; browser refresh failed (%s)",
+                type(exc).__name__,
+            )
+            detail = str(exc)
+            if detail.startswith("GPT-CLI browser profile is already in use"):
+                raise RuntimeError(
+                    "The cached ChatGPT access token has expired. "
+                    f"{detail} No browser lock files were removed."
+                ) from None
+            raise RuntimeError(
+                "The cached ChatGPT access token has expired and automatic refresh "
+                "failed. Sign in again with the GPT-CLI browser profile, then retry."
+            ) from None
+
+        if not bundle or not bundle.access_token or self.cache_mgr.is_token_expired(bundle.access_token):
+            raise RuntimeError(
+                "The cached ChatGPT access token has expired, but the browser profile "
+                "did not provide a fresh token. Sign in again with the GPT-CLI browser profile."
+            )
+        return bundle
+
+    def _configure_auth(self, bundle) -> None:
+        self.bundle = bundle
         self.headers = {
-            "Authorization": f"Bearer {self.bundle.access_token}",
+            "Authorization": f"Bearer {bundle.access_token}",
             "OAI-Product-Sku": "CONNECTOR_SETTING",
             "Content-Type": "application/json",
             "User-Agent": defaults.DEFAULT_USER_AGENT,
             "Referer": f"{self.base_url}/",
             "Origin": self.base_url,
         }
-        if self.bundle.chatgpt_account_id:
-            self.headers["ChatGPT-Account-ID"] = self.bundle.chatgpt_account_id
+        if bundle.chatgpt_account_id:
+            self.headers["ChatGPT-Account-ID"] = bundle.chatgpt_account_id
 
-        self._session: requests.Session | None = None
+    def _request(self, method: str, url: str, **kwargs):
+        """Issue one request, retrying once if another process rotated the cache token."""
+        kwargs["headers"] = self.headers
+        response = getattr(self.session, method)(url, **kwargs)
+        if response.status_code != 401:
+            return response
+
+        cached_bundle = self.cache_mgr.load_disk_cache()
+        if (
+            not cached_bundle
+            or not cached_bundle.access_token
+            or cached_bundle.access_token == self.bundle.access_token
+            or self.cache_mgr.is_token_expired(cached_bundle.access_token)
+        ):
+            return response
+
+        try:
+            if self._session is not None:
+                self._session.close()
+        finally:
+            self._session = None
+        self._configure_auth(cached_bundle)
+        kwargs["headers"] = self.headers
+        return getattr(self.session, method)(url, **kwargs)
 
     @property
     def session(self) -> requests.Session:
@@ -84,7 +147,7 @@ class PluginManager:
         url = f"{self.base_url}/backend-api/aip/connectors/links/list_accessible"
         payload = {"principals": [], "link_refresh_strategy": "NONE"}
         
-        resp = self.session.post(url, headers=self.headers, json=payload)
+        resp = self._request("post", url, json=payload)
         if resp.status_code != 200:
             raise RuntimeError(f"Failed to list connectors: HTTP {resp.status_code} - {resp.text}")
 
@@ -142,7 +205,7 @@ class PluginManager:
     def get_connector_source(self, connector_id: str) -> dict[str, Any]:
         """Fetch the native connector object used in message source metadata."""
         url = f"{self.base_url}/backend-api/aip/connectors/{connector_id}"
-        response = self.session.get(url, headers=self.headers)
+        response = self._request("get", url)
         if response.status_code != 200:
             raise RuntimeError(f"Failed to fetch connector source: HTTP {response.status_code}")
         source = response.json()
@@ -176,7 +239,7 @@ class PluginManager:
                 "mcp_url": target_url,
                 "auth_request": {"supported_auth": [{"type": "NONE"}]},
             }
-            res = self.session.post(endpoint, headers=self.headers, json=body)
+            res = self._request("post", endpoint, json=body)
             try:
                 data = res.json()
             except Exception:
@@ -194,12 +257,15 @@ class PluginManager:
                 status_code = alt_status
                 data = alt_data
 
-        # If connector with same name already exists (409), delete old and recreate
+        # A duplicate name belongs to an existing user app.  Never delete it as
+        # a side effect of an add request: removal is an explicit CLI command.
         if status_code == 409:
             existing_id = data.get("detail", {}).get("existing_connector_id")
             if existing_id:
-                self.session.delete(f"{self.base_url}/backend-api/aip/connectors/{existing_id}", headers=self.headers)
-                status_code, data = try_create_connector(clean_url)
+                raise RuntimeError(
+                    f"MCP connector '{name}' already exists ({existing_id}). "
+                    "Choose another name or remove it explicitly first."
+                )
 
         if status_code != 200:
             raise RuntimeError(
@@ -221,10 +287,10 @@ class PluginManager:
             "link_params": None,
             "action_param_schemas": None,
         }
-        link_resp = self.session.post(link_url, headers=self.headers, json=link_body)
+        link_resp = self._request("post", link_url, json=link_body)
         if link_resp.status_code != 200:
             # Clean up the dangling connector
-            self.session.delete(f"{self.base_url}/backend-api/aip/connectors/{connector_id}", headers=self.headers)
+            self._request("delete", f"{self.base_url}/backend-api/aip/connectors/{connector_id}")
             raise RuntimeError(
                 f"Failed to link connector '{name}': HTTP {link_resp.status_code} - {link_resp.text}"
             )
@@ -265,7 +331,7 @@ class PluginManager:
 
         url = f"{self.base_url}/backend-api/aip/connectors/links/{link_id}"
         payload = {"apps_privacy_control": permission}
-        resp = self.session.patch(url, headers=self.headers, json=payload)
+        resp = self._request("patch", url, json=payload)
         if resp.status_code != 200:
             raise RuntimeError(
                 f"Failed to set permission for link '{link_id}': HTTP {resp.status_code} - {resp.text}"
@@ -289,7 +355,7 @@ class PluginManager:
         # Delete link
         if link_id:
             url_link = f"{self.base_url}/backend-api/aip/connectors/links/{link_id}"
-            r_link = self.session.delete(url_link, headers=self.headers)
+            r_link = self._request("delete", url_link)
             if r_link.status_code in (200, 204, 404):
                 link_deleted = True
             else:
@@ -298,7 +364,7 @@ class PluginManager:
         # Delete connector
         if conn_id:
             url_conn = f"{self.base_url}/backend-api/aip/connectors/{conn_id}"
-            r_conn = self.session.delete(url_conn, headers=self.headers)
+            r_conn = self._request("delete", url_conn)
             if r_conn.status_code in (200, 204, 404):
                 conn_deleted = True
             else:
@@ -307,7 +373,7 @@ class PluginManager:
 
         if not link_id and not conn_id:
             url_link = f"{self.base_url}/backend-api/aip/connectors/links/{identifier}"
-            r_link = self.session.delete(url_link, headers=self.headers)
+            r_link = self._request("delete", url_link)
             if r_link.status_code in (200, 204):
                 link_deleted = True
 

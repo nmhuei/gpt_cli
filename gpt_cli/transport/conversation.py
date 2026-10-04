@@ -11,6 +11,7 @@ from curl_cffi.requests import AsyncSession
 from ..config import defaults
 from ..core.types import TokenBundle
 from ..telemetry.events import TelemetryEvent
+from ..telemetry.parser import SSETelemetryParser
 from .conduit import ConduitHandshake
 
 
@@ -67,6 +68,28 @@ class ConversationRecovery:
                 return []
             parent = node.get("parent") if isinstance(node, dict) else None
             node_id = parent if isinstance(parent, str) else None
+        return []
+
+    @staticmethod
+    def _current_branch_node_ids(mapping: dict[str, object], current_node: str) -> list[str]:
+        """Return the complete root-to-current branch for a newly-created turn.
+
+        This is deliberately separate from ``_branch_node_ids``: ordinary
+        recovery must prove that a fetched DAG belongs to its submitted user
+        message, while a fresh image turn may have its client UUID replaced by
+        the server before the image tool emits its asset node.
+        """
+        reverse_path: list[str] = []
+        node_id: str | None = current_node
+        visited: set[str] = set()
+        while node_id and node_id not in visited:
+            visited.add(node_id)
+            reverse_path.append(node_id)
+            node = mapping.get(node_id)
+            parent = node.get("parent") if isinstance(node, dict) else None
+            if parent == "client-created-root" or not isinstance(parent, str) or not parent:
+                return list(reversed(reverse_path))
+            node_id = parent
         return []
 
     @staticmethod
@@ -141,6 +164,7 @@ class ConversationRecovery:
                     "output": cls._message_text(content),
                     "source": "dag",
                 }))
+                events.extend(SSETelemetryParser()._image_artifact_events(message))
             elif content_type == "thoughts":
                 thoughts = content.get("thoughts")
                 if isinstance(thoughts, list) and thoughts:
@@ -164,6 +188,7 @@ class ConversationRecovery:
         conversation_id: str,
         *,
         expected_user_message_id: str | None = None,
+        allow_current_branch: bool = False,
     ) -> ConversationState:
         target_path = f"/backend-api/conversation/{conversation_id}"
         headers = ConduitHandshake.build_integrity_headers(
@@ -215,6 +240,13 @@ class ConversationRecovery:
                     mapping, current_node, expected_user_message_id
                 )
             matches_expected_message = bool(branch_node_ids)
+        if (
+            allow_current_branch
+            and not branch_node_ids
+            and isinstance(mapping, dict)
+            and isinstance(current_node, str)
+        ):
+            branch_node_ids = self._current_branch_node_ids(mapping, current_node)
         return ConversationState(
             node_id=current_node if isinstance(current_node, str) else None,
             parent_id=node.get("parent") if isinstance(node.get("parent"), str) else None,
@@ -233,6 +265,7 @@ class ConversationRecovery:
         conversation_id: str,
         *,
         expected_user_message_id: str | None = None,
+        allow_current_branch: bool = False,
         max_attempts: int = defaults.DEFAULT_RECOVERY_POLL_ATTEMPTS,
         interval_seconds: float = defaults.DEFAULT_RECOVERY_POLL_INTERVAL,
     ) -> ConversationState:
@@ -251,6 +284,7 @@ class ConversationRecovery:
                 state = await self.fetch(
                     conversation_id,
                     expected_user_message_id=expected_user_message_id,
+                    allow_current_branch=allow_current_branch,
                 )
                 last_state = state
 
@@ -286,4 +320,40 @@ class ConversationRecovery:
             if attempt < max_attempts - 1 and interval_seconds > 0:
                 await asyncio.sleep(interval_seconds)
 
+        return last_state
+
+    async def fetch_until_image_artifact(
+        self,
+        conversation_id: str,
+        *,
+        expected_user_message_id: str | None = None,
+        max_attempts: int = 30,
+        interval_seconds: float = 2.0,
+    ) -> ConversationState:
+        """Wait for an image tool's asynchronous asset node in a fresh DAG.
+
+        Image generation can acknowledge its tool call on SSE before its image
+        file node is committed.  This is intentionally image-only: ordinary
+        conversation recovery continues to stop as soon as its terminal node
+        is available.
+        """
+        import asyncio
+
+        last_state = ConversationState()
+        for attempt in range(max_attempts):
+            try:
+                state = await self.fetch(
+                    conversation_id,
+                    expected_user_message_id=expected_user_message_id,
+                    allow_current_branch=True,
+                )
+                last_state = state
+                if any(event.event_type == "image_artifact" for event in state.timeline):
+                    return state
+                if state.message_status in {"failed", "error"}:
+                    return state
+            except Exception:
+                pass
+            if attempt < max_attempts - 1 and interval_seconds > 0:
+                await asyncio.sleep(interval_seconds)
         return last_state

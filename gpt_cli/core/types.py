@@ -43,3 +43,5 @@ class TurnResult:
     status: str = "completed"
     error: str | None = None
     lifecycle_status: str | None = None
+    image_paths: list[str] = field(default_factory=list)
+    image_errors: list[str] = field(default_factory=list)

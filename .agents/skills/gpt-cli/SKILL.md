@@ -17,6 +17,7 @@ description: Use when needing to invoke, automate, control, or troubleshoot the 
 - **Granular Session Logs:** `~/.local/share/webgpt/sessions/<session_id>/` (`history.jsonl`, `events.jsonl`)
 - **Telemetry & Gateway Logs:** `~/.local/share/webgpt/logs/` (`live_telemetry.jsonl`, `gateway.log`)
 - **Systemd User Service:** `webgpt-gateway.service` (chạy micro gateway ASGI trên port 18000)
+- **Hướng dẫn Subagent Tự Trị & Kinh nghiệm thực chiến:** Xem skill [`using-gpt-cli`](../using-gpt-cli/SKILL.md)
 
 ---
 
@@ -50,6 +51,22 @@ gpt run -p "Tiếp tục bài trước" -s "sess_e3affde1" --json
 # 4. Chỉ định mức độ suy nghĩ (default: extended)
 gpt run -p "Câu hỏi khó" -e "extended" --json
 ```
+
+### Tạo và tải ảnh bằng GPT Image CLI
+
+```bash
+# Ảnh được tự tải về ~/Pictures/gpt-images/
+gpt image -p "3D anime, elf girl, fantasy, magic, cinematic"
+
+# JSON trả về đường dẫn trong image_paths
+gpt image -p "watercolor fox in a garden" --json
+```
+
+- `gpt image` mở một lượt tạo ảnh riêng, gọi image-generation tool và tự tải artifact về `~/Pictures/gpt-images/`; không cần mở web hay tải ảnh thủ công.
+- Dùng `-p/--prompt` cho mô tả ảnh. Prompt có thể là vài keyword để model tự sáng tạo hoặc mô tả chi tiết để kiểm soát kết quả.
+- Lệnh thường in `Image saved: <path>`; với `--json`, đọc `image_paths` và `image_errors` để lấy đường dẫn/kết quả.
+- Hiện CLI không có tham số đính kèm ảnh tham chiếu. Nếu người dùng đưa ảnh mẫu, xem ảnh rồi chuyển các đặc điểm phong cách/bố cục cần giữ thành prompt văn bản; đừng nói rằng ảnh mẫu đã được gửi cho model.
+- Xem cú pháp hiện hành bằng `gpt image --help`.
 
 ### Quản Lý Session & Xem Log Debug Phục Vụ Phân Tích
 
@@ -304,4 +321,3 @@ npx @deepseek-ai/dsh tui
 # 3. Chế độ Giao Diện Web (Web UI trên cổng 3080)
 npx @deepseek-ai/dsh web --no-open --port 3080
 ```
-

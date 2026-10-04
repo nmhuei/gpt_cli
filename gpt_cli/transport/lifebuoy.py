@@ -35,13 +35,15 @@ class BrowserLifebuoy:
         profile_path = Path(profile_dir) if profile_dir else self.cache_mgr.cache_dir
         profile_path.mkdir(parents=True, exist_ok=True)
 
-        for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            p = profile_path / lock_file
-            if p.is_symlink() or p.exists():
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        lock_files = [
+            profile_path / name
+            for name in ("SingletonLock", "SingletonSocket", "SingletonCookie")
+        ]
+        if any(path.exists() or path.is_symlink() for path in lock_files):
+            raise RuntimeError(
+                "GPT-CLI browser profile is already in use (lock files are present). "
+                "Close the browser using this profile and retry; existing lock files were left untouched."
+            )
 
         is_playwright_cm = False
         pw_cm = None
@@ -80,6 +82,8 @@ class BrowserLifebuoy:
             token = data.get("accessToken") or ""
             if not token:
                 raise RuntimeError("BrowserLifebuoy failed: Empty access token returned from browser session")
+            if self.cache_mgr.is_token_expired(token):
+                raise RuntimeError("BrowserLifebuoy failed: browser session returned an expired access token")
             account_id = data.get("accountId") or self.cache_mgr.extract_account_id(token)
             bundle = TokenBundle(
                 access_token=token,

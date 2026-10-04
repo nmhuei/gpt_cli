@@ -38,6 +38,87 @@ def test_cli_parser_run_command():
     assert args.resume_session == "sess_custom"
 
 
+def test_cli_parser_agent_defaults_to_a_thirty_minute_continuous_session():
+    parser = build_cli_parser()
+
+    args = parser.parse_args(["agent", "-b", "br", "solve /tmp/challenge"])
+
+    assert args.command == "agent"
+    assert args.min_runtime_minutes == 30.0
+    assert args.bridge == "br"
+
+
+def test_agent_continues_from_the_same_dag_until_runtime_budget(monkeypatch, tmp_path, capsys):
+    """A short completed turn is not permission for an autonomous agent to stop."""
+    import asyncio
+    from gpt_cli.cli.main import handle_agent
+    from gpt_cli.core.types import TokenBundle, TurnResult
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_send_turn(self, prompt, conversation_id=None, parent_id=None, **kwargs):
+        calls.append((prompt, conversation_id, parent_id))
+        idx = len(calls)
+        return TurnResult(
+            text=f"turn-{idx}",
+            conversation_id="conv_agent",
+            message_id=f"msg_{idx}",
+            model="gpt-5-6-thinking",
+            duration_ms=100,
+        )
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args([
+        "agent", "--min-runtime-minutes", "0.003", "solve /tmp/challenge",
+    ])
+    asyncio.run(handle_agent(args))
+
+    assert [call[0].split()[-1] for call in calls] == ["/tmp/challenge", "continue"]
+    assert calls[0][1:] == (None, None)
+    assert calls[1][1:] == ("conv_agent", "msg_1")
+    assert "Agent runtime target reached" in capsys.readouterr().out
+
+
+def test_agent_json_emits_one_final_runtime_document(monkeypatch, tmp_path, capsys):
+    import asyncio
+    import json
+    from gpt_cli.cli.main import handle_agent
+    from gpt_cli.core.types import TokenBundle, TurnResult
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    call_count = 0
+
+    async def fake_send_turn(self, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return TurnResult(
+            text="hidden from JSON stdout",
+            conversation_id="conv_agent",
+            message_id=f"msg_{call_count}",
+            model="gpt-5-6-thinking",
+            duration_ms=100,
+        )
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args([
+        "agent", "--json", "--min-runtime-minutes", "0.003", "solve /tmp/challenge",
+    ])
+    asyncio.run(handle_agent(args))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["status"] == "runtime_target_reached"
+
+
 def test_cli_parser_accepts_bridge_prompt_shortcut_without_run_command():
     args = parse_cli_args(["-b", "br", "-p", "solve /tmp/challenge"])
 
@@ -150,7 +231,10 @@ def test_cli_json_is_one_document_when_telemetry_arrives(monkeypatch, tmp_path, 
 
     rendered = capsys.readouterr().out
     assert len(rendered.splitlines()) == 1
-    assert json.loads(rendered)["text"] == "healthy"
+    output = json.loads(rendered)
+    assert output["text"] == "healthy"
+    assert output["thinking"] == ["Checking health"]
+    assert output["tool_calls"] == [{"id": "tool_1", "tool": "health_check", "payload": "{}", "source": "dag"}]
 
 
 def test_cli_explicit_bridge_selects_registered_mcp_connector(monkeypatch, tmp_path):
@@ -178,6 +262,35 @@ def test_cli_explicit_bridge_selects_registered_mcp_connector(monkeypatch, tmp_p
     asyncio.run(handle_run(args))
 
     assert observed["system_hints"] == ["connector_br"]
+    assert observed["selected_mcp_sources"] == [{"id": "connector_br", "name": "br"}]
+
+
+def test_cli_leading_space_before_explicit_bridge_still_attaches_connector(monkeypatch, tmp_path):
+    """Prompt normalization must not remove the only evidence for attachment."""
+    import asyncio
+    from gpt_cli.cli.main import handle_run
+    from gpt_cli.core.types import TokenBundle, TurnResult
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(
+        "gpt_cli.cli.main.resolve_connector_context",
+        lambda name: (["connector_br"], [{"id": "connector_br", "name": name}]),
+    )
+
+    async def fake_send_turn(self, prompt, *args, **kwargs):
+        observed["prompt"] = prompt
+        observed["selected_mcp_sources"] = kwargs.get("selected_mcp_sources")
+        return TurnResult(text="done", conversation_id="conv_1", message_id="msg_1", model="gpt-5-6-thinking")
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args(["run", "--json", " @br check health"])
+    asyncio.run(handle_run(args))
+
+    assert observed["prompt"] == "[$br](app://connector_br) check health"
     assert observed["selected_mcp_sources"] == [{"id": "connector_br", "name": "br"}]
 
 

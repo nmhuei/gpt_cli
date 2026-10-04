@@ -9,6 +9,7 @@ Runtime tinh gọn thế hệ mới điều khiển ChatGPT Web trực tiếp qu
 
 - **Vị trí Source Code & Bảo trì:** [`/home/light/GitHub/gpt_cli`](file:///home/light/GitHub/gpt_cli)
 - **Skill chi tiết đầy đủ:** Tham khảo skill `gpt-cli` ([`SKILL.md`](../gpt-cli/SKILL.md))
+- **Kinh nghiệm thực chiến & Subagent Tự Trị:** Tham khảo skill `using-gpt-cli` ([`SKILL.md`](../using-gpt-cli/SKILL.md))
 - **Launcher:** [`/home/light/.local/bin/gpt`](file:///home/light/.local/bin/gpt)
 
 ---
