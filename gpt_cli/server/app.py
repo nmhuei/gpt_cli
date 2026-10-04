@@ -11,16 +11,28 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-logger = logging.getLogger("gpt_cli.server")
-
-from ..config import defaults
 from ..config.settings import Settings
 from ..core.token_cache import TokenCacheManager
 from ..models.registry import ModelRegistry
-from ..transport.wire import WireTransport
 from ..pool.worker_pool import WorkerPool
 from ..session.registry import SessionRegistry
 from ..telemetry.formatter import format_tool_call, format_tool_output
+from ..transport.wire import WireTransport
+from .gateway import (
+    SSEQueueOverflow,
+    _safe_queue_put,
+    _validate_gateway_messages,
+)
+
+
+logger = logging.getLogger("gpt_cli.server")
+
+
+async def _finish_sse_worker(queue: asyncio.Queue) -> None:
+    if asyncio.current_task().cancelling():
+        return
+    await queue.put(None)
+
 
 def _extract_content(content_obj: Any) -> str:
     if isinstance(content_obj, str):
@@ -268,9 +280,10 @@ async def chat_completions(request: Request) -> Response:
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON"}}, status_code=400)
 
-    messages = body.get("messages", [])
-    if not messages:
-        return JSONResponse({"error": {"message": "Messages cannot be empty"}}, status_code=400)
+    body, error = _validate_gateway_messages(body)
+    if error:
+        return error
+    messages = body["messages"]
 
     model_alias = body.get("model", "gpt-5-6-thinking")
     is_stream = bool(body.get("stream", False))
@@ -349,7 +362,7 @@ async def chat_completions(request: Request) -> Response:
                 if title:
                     new_th.append(title)
                 if new_th:
-                    queue.put_nowait({
+                    _safe_queue_put(queue, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "choices": [{"index": 0, "delta": {"reasoning_content": "\n".join(new_th) + "\n"}, "finish_reason": None}]
@@ -357,7 +370,7 @@ async def chat_completions(request: Request) -> Response:
             elif ev.event_type == "reasoning_recap":
                 recap = ev.data.get("recap", "")
                 if recap:
-                    queue.put_nowait({
+                    _safe_queue_put(queue, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "choices": [{"index": 0, "delta": {"reasoning_content": f"[{recap}]\n"}, "finish_reason": None}]
@@ -365,7 +378,7 @@ async def chat_completions(request: Request) -> Response:
             elif ev.event_type == "delta":
                 text = ev.data.get("text", "")
                 if text:
-                    queue.put_nowait({
+                    _safe_queue_put(queue, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
@@ -377,7 +390,7 @@ async def chat_completions(request: Request) -> Response:
                 tool_block = f"\n{title}\n"
                 if input_details:
                     tool_block += f"📥 {input_details}\n"
-                queue.put_nowait({
+                _safe_queue_put(queue, {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "choices": [{"index": 0, "delta": {"reasoning_content": tool_block}, "finish_reason": None}]
@@ -388,19 +401,22 @@ async def chat_completions(request: Request) -> Response:
                 title = ev.data.get("title") or ""
                 formatted_out = format_tool_output(tool_label, output, title)
                 tool_block = f"📤 Output:\n{formatted_out}\n\n"
-                queue.put_nowait({
+                _safe_queue_put(queue, {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "choices": [{"index": 0, "delta": {"reasoning_content": tool_block}, "finish_reason": None}]
                 })
             elif ev.event_type == "done":
-                queue.put_nowait({
+                _safe_queue_put(queue, {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 })
 
+        overflowed = False
+
         async def worker():
+            nonlocal overflowed
             try:
                 async with WireTransport(bundle) as transport:
                     await transport.send_turn(
@@ -409,8 +425,10 @@ async def chat_completions(request: Request) -> Response:
                         effort="extended",
                         on_event=on_event
                     )
+            except SSEQueueOverflow:
+                overflowed = True
             finally:
-                queue.put_nowait(None)
+                await _finish_sse_worker(queue)
 
         task = asyncio.create_task(pool.execute(worker))
         try:
@@ -419,10 +437,17 @@ async def chat_completions(request: Request) -> Response:
                 if item is None:
                     break
                 yield f"data: {json.dumps(item)}\n\n"
+            if overflowed:
+                yield "data: {\"error\": {\"message\": \"SSE queue overflow\"}}\n\n"
+                return
             yield "data: [DONE]\n\n"
         finally:
             if not task.done():
                 task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -432,9 +457,10 @@ async def anthropic_messages(request: Request) -> Response:
     except Exception:
         return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON"}}, status_code=400)
 
-    messages = body.get("messages", [])
-    if not messages:
-        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": "Messages cannot be empty"}}, status_code=400)
+    body, error = _validate_gateway_messages(body, anthropic=True)
+    if error:
+        return error
+    messages = body["messages"]
 
     system_text = _extract_content(body.get("system", ""))
     model_alias = body.get("model", "gpt-5-6-thinking")
@@ -610,7 +636,7 @@ async def anthropic_messages(request: Request) -> Response:
     async def event_generator():
         queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue(maxsize=100)
 
-        queue.put_nowait(("message_start", {
+        _safe_queue_put(queue, ("message_start", {
             "type": "message_start",
             "message": {
                 "id": msg_id,
@@ -642,7 +668,7 @@ async def anthropic_messages(request: Request) -> Response:
                 resolved_name, should_unwrap = _resolve_tool_name(active_tool_name or "tool", registered_tools)
                 args_obj = _normalize_tool_payload(resolved_name, active_tool_payload, should_unwrap)
                 print(f"[GATEWAY-TOOL] resolved={resolved_name}, active_name={active_tool_name}, args={args_obj}", flush=True)
-                queue.put_nowait(("content_block_delta", {
+                _safe_queue_put(queue, ("content_block_delta", {
                     "type": "content_block_delta",
                     "index": current_block_index,
                     "delta": {
@@ -650,7 +676,7 @@ async def anthropic_messages(request: Request) -> Response:
                         "partial_json": json.dumps(args_obj)
                     }
                 }))
-                queue.put_nowait(("content_block_stop", {
+                _safe_queue_put(queue, ("content_block_stop", {
                     "type": "content_block_stop",
                     "index": current_block_index
                 }))
@@ -659,7 +685,7 @@ async def anthropic_messages(request: Request) -> Response:
                 active_tool_name = None
                 active_tool_payload = None
             elif current_block_type is not None:
-                queue.put_nowait(("content_block_stop", {
+                _safe_queue_put(queue, ("content_block_stop", {
                     "type": "content_block_stop",
                     "index": current_block_index
                 }))
@@ -691,12 +717,12 @@ async def anthropic_messages(request: Request) -> Response:
                         current_block_index += 1
                         current_block_type = "thinking"
                         last_block_type = "thinking"
-                        queue.put_nowait(("content_block_start", {
+                        _safe_queue_put(queue, ("content_block_start", {
                             "type": "content_block_start",
                             "index": current_block_index,
                             "content_block": {"type": "thinking", "thinking": ""}
                         }))
-                    queue.put_nowait(("content_block_delta", {
+                    _safe_queue_put(queue, ("content_block_delta", {
                         "type": "content_block_delta",
                         "index": current_block_index,
                         "delta": {"type": "thinking_delta", "thinking": th_text}
@@ -713,12 +739,12 @@ async def anthropic_messages(request: Request) -> Response:
                         current_block_index += 1
                         current_block_type = "thinking"
                         last_block_type = "thinking"
-                        queue.put_nowait(("content_block_start", {
+                        _safe_queue_put(queue, ("content_block_start", {
                             "type": "content_block_start",
                             "index": current_block_index,
                             "content_block": {"type": "thinking", "thinking": ""}
                         }))
-                    queue.put_nowait(("content_block_delta", {
+                    _safe_queue_put(queue, ("content_block_delta", {
                         "type": "content_block_delta",
                         "index": current_block_index,
                         "delta": {"type": "thinking_delta", "thinking": th_text}
@@ -741,7 +767,7 @@ async def anthropic_messages(request: Request) -> Response:
                     resolved_name, _ = _resolve_tool_name(active_tool_name, registered_tools)
                     active_tool_payload = new_payload or "{}"
                     tool_use_id = f"toolu_{uuid.uuid4().hex[:20]}"
-                    queue.put_nowait(("content_block_start", {
+                    _safe_queue_put(queue, ("content_block_start", {
                         "type": "content_block_start",
                         "index": current_block_index,
                         "content_block": {
@@ -769,12 +795,12 @@ async def anthropic_messages(request: Request) -> Response:
                         current_block_index += 1
                         current_block_type = "text"
                         last_block_type = "text"
-                        queue.put_nowait(("content_block_start", {
+                        _safe_queue_put(queue, ("content_block_start", {
                             "type": "content_block_start",
                             "index": current_block_index,
                             "content_block": {"type": "text", "text": ""}
                         }))
-                    queue.put_nowait(("content_block_delta", {
+                    _safe_queue_put(queue, ("content_block_delta", {
                         "type": "content_block_delta",
                         "index": current_block_index,
                         "delta": {"type": "text_delta", "text": text}
@@ -789,25 +815,28 @@ async def anthropic_messages(request: Request) -> Response:
                 close_current_block()
                 if current_block_index == -1:
                     current_block_index = 0
-                    queue.put_nowait(("content_block_start", {
+                    _safe_queue_put(queue, ("content_block_start", {
                         "type": "content_block_start",
                         "index": 0,
                         "content_block": {"type": "text", "text": ""}
                     }))
-                    queue.put_nowait(("content_block_stop", {
+                    _safe_queue_put(queue, ("content_block_stop", {
                         "type": "content_block_stop",
                         "index": 0
                     }))
 
                 stop_reason = "tool_use" if last_block_type == "tool_use" else "end_turn"
-                queue.put_nowait(("message_delta", {
+                _safe_queue_put(queue, ("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                     "usage": {"output_tokens": out_tokens}
                 }))
-                queue.put_nowait(("message_stop", {"type": "message_stop"}))
+                _safe_queue_put(queue, ("message_stop", {"type": "message_stop"}))
+
+        overflowed = False
 
         async def worker():
+            nonlocal overflowed
             try:
                 async with WireTransport(bundle) as transport:
                     turn_res = await transport.send_turn(
@@ -823,13 +852,15 @@ async def anthropic_messages(request: Request) -> Response:
                         final_m = captured_msg_id or turn_res.message_id
                         if final_c and final_m:
                             reg.update_turn(sess.local_id, conversation_id=final_c, last_message_id=final_m, model=model_alias)
+            except SSEQueueOverflow:
+                overflowed = True
             except (asyncio.CancelledError, Exception):
                 if sess and not is_compaction:
                     if captured_conv_id and captured_msg_id:
                         reg.update_turn(sess.local_id, conversation_id=captured_conv_id, last_message_id=captured_msg_id, model=model_alias)
                 raise
             finally:
-                queue.put_nowait(None)
+                await _finish_sse_worker(queue)
 
         task = asyncio.create_task(pool.execute(worker))
         try:
@@ -839,13 +870,16 @@ async def anthropic_messages(request: Request) -> Response:
                     break
                 event_name, data = item
                 yield f"event: {event_name}\ndata: {json.dumps(data)}\n\n"
+            if overflowed:
+                error_data = json.dumps({"error": {"message": "SSE queue overflow"}})
+                yield f"event: error\ndata: {error_data}\n\n"
         finally:
             if not task.done():
                 task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

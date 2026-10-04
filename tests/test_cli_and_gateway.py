@@ -29,6 +29,49 @@ def test_gateway_messages_empty_validation():
     assert res.status_code == 400
     assert "Messages cannot be empty" in res.json()["error"]["message"]
 
+def test_gateway_chat_completion_error_shape_for_empty_messages():
+    app = create_app()
+    client = TestClient(app)
+    res = client.post("/v1/chat/completions", json={"model": "gpt-5-6-thinking", "messages": []})
+    assert res.status_code == 400
+    body = res.json()
+    assert set(body) == {"error"}
+    assert body["error"]["message"] == "Messages cannot be empty"
+
+
+def test_gateway_anthropic_error_shape_for_invalid_json():
+    app = create_app()
+    client = TestClient(app)
+    res = client.post("/v1/messages", content="{invalid", headers={"content-type": "application/json"})
+    assert res.status_code == 400
+    body = res.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "Invalid JSON" in body["error"]["message"]
+
+
+def test_gateway_chat_rejects_malformed_message_shape():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5-6-thinking", "messages": [{"content": "missing role"}]},
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["message"] == "Messages must contain role and content"
+
+
+def test_gateway_anthropic_rejects_non_object_message_entry():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={"model": "gpt-5-6-thinking", "messages": ["bad"]},
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+
+
 def test_cli_parser_run_command():
     parser = build_cli_parser()
     args = parser.parse_args(["run", "-p", "Test prompt", "--json", "--resume-session", "sess_custom"])
@@ -236,6 +279,22 @@ def test_cli_json_is_one_document_when_telemetry_arrives(monkeypatch, tmp_path, 
     assert output["thinking"] == ["Checking health"]
     assert output["tool_calls"] == [{"id": "tool_1", "tool": "health_check", "payload": "{}", "source": "dag"}]
 
+
+
+def test_wire_payload_keeps_selected_mcp_source_in_prepare_and_message_metadata():
+    from gpt_cli.transport.wire import WireTransport
+    from gpt_cli.core.types import TokenBundle
+
+    transport = WireTransport.__new__(WireTransport)
+    payload = transport.build_payload(
+        prompt="health",
+        model_alias="gpt-5-6-thinking",
+        selected_mcp_sources=[{"id": "connector_br", "name": "br"}],
+    )
+
+    assert payload["messages"][0]["metadata"]["selected_mcp_sources"] == [
+        {"id": "connector_br", "name": "br"}
+    ]
 
 def test_cli_explicit_bridge_selects_registered_mcp_connector(monkeypatch, tmp_path):
     import asyncio
@@ -808,3 +867,218 @@ def test_cli_parser_keeps_session_new_as_the_only_metadata_creator():
     assert args.command == "session"
     assert args.session_action == "new"
     assert args.tag == "sub-tag"
+
+
+
+def test_sse_queue_overflow_aborts_instead_of_dropping_frames():
+    import asyncio
+
+    from gpt_cli.server.app import SSEQueueOverflow, _safe_queue_put
+
+    queue = asyncio.Queue(maxsize=1)
+    queue.put_nowait("first")
+
+    try:
+        _safe_queue_put(queue, "second")
+    except SSEQueueOverflow:
+        pass
+    else:
+        raise AssertionError("overflow must abort rather than drop SSE frames")
+
+    assert queue.get_nowait() == "first"
+
+
+def test_safe_queue_put_preserves_order_when_capacity_exists():
+    import asyncio
+
+    from gpt_cli.server.app import _safe_queue_put
+
+    queue = asyncio.Queue(maxsize=3)
+    for frame in ["one", "two", "three"]:
+        _safe_queue_put(queue, frame)
+
+    assert [queue.get_nowait(), queue.get_nowait(), queue.get_nowait()] == ["one", "two", "three"]
+
+
+def test_chat_completions_sse_overflow_terminates_with_error(monkeypatch):
+    from gpt_cli.core.types import TokenBundle
+    from gpt_cli.server import app as server_app
+    from gpt_cli.telemetry.events import TelemetryEvent
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        on_event(TelemetryEvent(event_type="delta", data={"text": "first-frame"}))
+        on_event(TelemetryEvent(event_type="delta", data={"text": "overflow"}))
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    original = server_app._safe_queue_put
+    calls = {"n": 0}
+
+    def overflow_after_first(queue, item):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise server_app.SSEQueueOverflow("forced")
+        original(queue, item)
+
+    monkeypatch.setattr(server_app, "_safe_queue_put", overflow_after_first)
+
+    res = TestClient(create_app()).post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5-6-thinking", "stream": True, "messages": [{"role": "user", "content": "test"}]},
+    )
+    assert res.status_code == 200
+    assert "first-frame" in res.text
+    assert "SSE queue overflow" in res.text
+    assert res.text.index("first-frame") < res.text.index("SSE queue overflow")
+
+
+def test_anthropic_sse_overflow_terminates_with_error(monkeypatch):
+    from gpt_cli.core.types import TokenBundle
+    from gpt_cli.server import app as server_app
+    from gpt_cli.telemetry.events import TelemetryEvent
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        on_event(TelemetryEvent(event_type="thinking", data={"thoughts": [{"summary": "first-frame"}]}))
+        on_event(TelemetryEvent(event_type="thinking", data={"thoughts": [{"summary": "overflow"}]}))
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    original = server_app._safe_queue_put
+    calls = {"n": 0}
+
+    def overflow_after_first(queue, item):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise server_app.SSEQueueOverflow("forced")
+        original(queue, item)
+
+    monkeypatch.setattr(server_app, "_safe_queue_put", overflow_after_first)
+
+    res = TestClient(create_app()).post(
+        "/v1/messages",
+        json={"model": "gpt-5-6-thinking", "stream": True, "messages": [{"role": "user", "content": "test"}]},
+    )
+    assert res.status_code == 200
+    assert "first-frame" in res.text
+    assert "SSE queue overflow" in res.text
+
+
+
+def test_sse_overflow_preserves_queued_frame_before_error():
+    import asyncio
+
+    from gpt_cli.server.app import SSEQueueOverflow, _safe_queue_put
+
+    queue = asyncio.Queue(maxsize=1)
+    _safe_queue_put(queue, "first-frame")
+
+    try:
+        _safe_queue_put(queue, "second-frame")
+    except SSEQueueOverflow:
+        pass
+
+    assert queue.get_nowait() == "first-frame"
+
+
+def test_gateway_openai_rejects_top_level_json_array():
+    client = TestClient(create_app())
+    res = client.post("/v1/chat/completions", json=[])
+    assert res.status_code == 400
+    body = res.json()
+    assert set(body) == {"error"}
+    assert body["error"]["message"] == "Request body must be an object"
+
+
+def test_gateway_anthropic_rejects_top_level_json_array():
+    client = TestClient(create_app())
+    res = client.post("/v1/messages", json=[])
+    assert res.status_code == 400
+    body = res.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["message"] == "Request body must be an object"
+
+
+def test_sse_sentinel_waits_when_queue_has_space():
+    import asyncio
+
+    from gpt_cli.server.app import _finish_sse_worker
+
+    async def run():
+        queue = asyncio.Queue(maxsize=1)
+        await _finish_sse_worker(queue)
+        assert queue.get_nowait() is None
+
+    asyncio.run(run())
+
+
+def test_sse_sentinel_is_skipped_only_when_worker_cancelling():
+    import asyncio
+
+    from gpt_cli.server.app import _finish_sse_worker
+
+    async def run():
+        queue = asyncio.Queue(maxsize=1)
+
+        async def cancelled_worker():
+            asyncio.current_task().cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                await _finish_sse_worker(queue)
+
+        task = asyncio.create_task(cancelled_worker())
+        await task
+        assert queue.empty()
+
+    asyncio.run(run())
+
+
+def test_sse_sentinel_full_queue_unblocks_after_consumer_drain():
+    import asyncio
+
+    from gpt_cli.server.app import _finish_sse_worker
+
+    async def run():
+        queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait("frame")
+
+        producer = asyncio.create_task(_finish_sse_worker(queue))
+        await asyncio.sleep(0)
+        assert not producer.done()
+
+        assert await queue.get() == "frame"
+        await asyncio.wait_for(producer, timeout=1)
+        assert await queue.get() is None
+
+    asyncio.run(run())
+
+
+def test_sse_sentinel_cancellation_propagates():
+    import asyncio
+
+    from gpt_cli.server.app import _finish_sse_worker
+
+    async def run():
+        queue = asyncio.Queue(maxsize=1)
+
+        async def cancelled():
+            task = asyncio.current_task()
+            task.cancel()
+            await _finish_sse_worker(queue)
+            await asyncio.sleep(0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled()
+
+    asyncio.run(run())

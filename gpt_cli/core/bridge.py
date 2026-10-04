@@ -6,6 +6,10 @@ def resolve_connector_context(connector_name: str | None) -> tuple[list[str], li
     if not connector_name:
         return [], []
 
+    connector_name = str(connector_name).lstrip("@").strip()
+    if not connector_name:
+        return [], []
+
     from ..plugins.manager import PluginManager
 
     manager = PluginManager()

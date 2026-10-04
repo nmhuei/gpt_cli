@@ -72,6 +72,24 @@ def test_resolve_prompt_already_wrapped_no_double():
     assert res == "@br solve"
 
 
+def test_resolve_connector_system_hints_accepts_at_prefixed_bridge(monkeypatch):
+    class Plugin:
+        connector_id = "connector_br"
+        auth_status = "ACTIVE"
+
+    class PluginManager:
+        def find_plugin(self, name):
+            assert name == "br"
+            return Plugin()
+
+        def get_connector_source(self, connector_id):
+            return {"id": connector_id}
+
+    monkeypatch.setattr("gpt_cli.plugins.manager.PluginManager", PluginManager)
+
+    assert resolve_connector_system_hints("@br") == ["connector_br"]
+
+
 def test_resolve_connector_system_hints_uses_registered_connector_id(monkeypatch):
     class Plugin:
         connector_id = "connector_br"
