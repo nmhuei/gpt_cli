@@ -246,7 +246,17 @@ class PluginManager:
                 data = {"raw_text": res.text}
             return res.status_code, data
 
-        # Step 1: Create MCP connector
+        # Step 1: Create MCP connector.  Existing plugins are never removed:
+        # when the name is taken, append a numeric suffix (br -> br-2 -> br-3).
+        try:
+            taken = {p.name.lower() for p in self.list_plugins(include_system=True)}
+        except RuntimeError:
+            taken = set()
+        base_name = name
+        suffix = 2
+        while name.lower() in taken:
+            name = f"{base_name}-{suffix}"
+            suffix += 1
         status_code, data = try_create_connector(clean_url)
         # If failed with 424 and no path, attempt auto-appending /mcp
         if status_code in (404, 424) and not clean_url.endswith("/mcp"):

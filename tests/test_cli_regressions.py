@@ -969,6 +969,82 @@ cli_main.main()
     assert 'Error:' in proc.stderr
 
 
+def test_main_help_word_prints_help_without_starting_a_turn(monkeypatch, capsys):
+    """The standalone help word must never become an upstream prompt."""
+    import gpt_cli.cli.main as cli_main
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("help must not start a model turn")
+
+    monkeypatch.setattr(cli_main, "handle_run", fail_if_called)
+    monkeypatch.setattr(sys, "argv", ["gpt", "help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main()
+
+    assert exc_info.value.code == 0
+    assert "usage: gpt" in capsys.readouterr().out
+
+
+def test_main_plugin_help_word_prints_plugin_help(monkeypatch, capsys):
+    """The plugin help word must map to argparse help."""
+    import gpt_cli.cli.main as cli_main
+
+    monkeypatch.setattr(sys, "argv", ["gpt", "plugin", "help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main()
+
+    assert exc_info.value.code == 0
+    assert "usage: gpt plugin" in capsys.readouterr().out
+
+
+def test_main_reports_unexpected_operational_errors_without_traceback(monkeypatch, capsys):
+    """Unhandled command errors must have one clean CLI error boundary."""
+    import gpt_cli.cli.main as cli_main
+
+    monkeypatch.setattr(sys, "argv", ["gpt", "status"])
+    monkeypatch.setattr(
+        cli_main,
+        "status_daemon",
+        lambda: (_ for _ in ()).throw(RuntimeError("daemon socket unavailable")),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main()
+
+    assert exc_info.value.code == 1
+    stderr = capsys.readouterr().err
+    assert "Error: daemon socket unavailable" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_main_handles_keyboard_interrupt_without_traceback(tmp_path):
+    """Ctrl+C during a turn must exit with the shell-standard interrupt code."""
+    code = """
+import sys
+from gpt_cli.cli import main as cli_main
+
+async def interrupt_turn(*_args, **_kwargs):
+    raise KeyboardInterrupt
+
+cli_main.handle_run = interrupt_turn
+sys.argv = ['gpt', 'run', 'test prompt']
+cli_main.main()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+    )
+
+    assert proc.returncode == 130
+    assert "Cancelled by user." in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 
 def test_main_delete_registry_save_failure_reports_partial_delete_and_keeps_registry(tmp_path, monkeypatch, capsys):
     """A registry persistence failure after log removal is a clean partial delete."""

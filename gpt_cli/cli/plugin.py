@@ -35,9 +35,12 @@ def handle_plugin(args: argparse.Namespace, plugin_manager_cls=PluginManager) ->
         return
 
     if args.plugin_action == "add":
+        from ..config.settings import Settings
+
+        mcp_url = Settings().resolve_mcp_url(args.mcp_url)
         plugin = manager.add_mcp_plugin(
             name=args.name,
-            mcp_url=args.mcp_url,
+            mcp_url=mcp_url,
             description=args.description,
             permission=args.permission,
         )

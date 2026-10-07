@@ -55,6 +55,9 @@ class Settings:
     default_mcp_tunnel_file: Path = field(
         default_factory=lambda: Path(os.getenv("DEFAULT_MCP_TUNNEL_FILE", str(defaults.default_mcp_tunnel_file()))).expanduser()
     )
+    bqa_tunnel_file: Path = field(
+        default_factory=lambda: Path(os.getenv("BQA_TUNNEL_FILE", str(defaults.DEFAULT_BQA_TUNNEL_FILE))).expanduser()
+    )
     # BQA is a local, redacted host-activity side channel.  It is deliberately
     # independent of the public MCP tunnel and only used for bound sessions.
     bqa_activity_url: str = field(
@@ -63,21 +66,35 @@ class Settings:
         ).rstrip("/")
     )
 
+    @staticmethod
+    def _read_tunnel_file(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        try:
+            base = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not base:
+            return None
+        return base if base.endswith("/mcp") else base.rstrip("/") + "/mcp"
+
     def resolve_mcp_url(self, explicit_url: str | None = None) -> str:
-        """Resolves target MCP URL: explicit -> env static -> dynamic tunnel file."""
+        """Resolves target MCP URL: 'bqa' keyword -> explicit -> env static -> dynamic tunnel file."""
+        if explicit_url and explicit_url.strip().lower() == defaults.BQA_URL_KEYWORD:
+            url = self._read_tunnel_file(self.bqa_tunnel_file)
+            if not url:
+                raise ValueError(
+                    f"BQA tunnel URL not found in {self.bqa_tunnel_file}. "
+                    "Start the BQA tunnel or set BQA_TUNNEL_FILE."
+                )
+            return url
         if explicit_url:
             return explicit_url.strip()
         if self.default_mcp_url:
             return self.default_mcp_url.strip()
-        if self.default_mcp_tunnel_file.is_file():
-            try:
-                base = self.default_mcp_tunnel_file.read_text(encoding="utf-8").strip()
-                if base:
-                    if not base.endswith("/mcp"):
-                        base = base.rstrip("/") + "/mcp"
-                    return base
-            except Exception:
-                pass
+        url = self._read_tunnel_file(self.default_mcp_tunnel_file)
+        if url:
+            return url
         raise ValueError(
             "No MCP URL provided and could not resolve from DEFAULT_MCP_URL or DEFAULT_MCP_TUNNEL_FILE. "
             "Please specify a URL or ensure the tunnel is running."

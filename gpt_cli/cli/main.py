@@ -256,8 +256,8 @@ def handle_plugin(args: argparse.Namespace) -> None:
 
 
 
-def main() -> None:
-    known_commands = {"run", "agent", "research", "image", "chat", "steer", "session", "plugin", "start", "stop", "restart", "status", "login", "-h", "--help"}
+def _main() -> None:
+    known_commands = {"run", "agent", "research", "image", "chat", "steer", "session", "plugin", "start", "stop", "restart", "status", "login", "help", "-h", "--help"}
     if len(sys.argv) == 1:
         asyncio.run(interactive_chat())
         return
@@ -331,6 +331,24 @@ def main() -> None:
         else:
             print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+def main() -> None:
+    """Run the CLI with one boundary for user-facing failures."""
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("Cancelled by user.", file=sys.stderr)
+        raise SystemExit(130) from None
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        if "--json" in sys.argv[1:]:
+            print(json.dumps({"status": "error", "message": message}))
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 if __name__ == "__main__":
     main()

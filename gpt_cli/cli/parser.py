@@ -133,7 +133,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     plugin_list_p.add_argument("--json", action="store_true", help="Output JSON")
     plugin_add_p = plugin_sub.add_parser("add", help="Create, connect, and authorize a no-auth MCP plugin")
     plugin_add_p.add_argument("name", help="Name shown in ChatGPT, for example br")
-    plugin_add_p.add_argument("mcp_url", help="MCP server URL")
+    plugin_add_p.add_argument(
+        "mcp_url", nargs="?", default=None,
+        help="MCP server URL, or 'bqa' to read the live BQA tunnel URL (default: DEFAULT_MCP_URL / tunnel file)",
+    )
     plugin_add_p.add_argument("--description", default="", help="Optional connector description")
     plugin_add_p.add_argument(
         "--permission", default="full_access",
@@ -179,7 +182,19 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
     local session unless an explicit resume flag is supplied.
     """
     parser = build_cli_parser()
-    if argv and argv[0].startswith("-") and argv[0] not in {"-h", "--help"}:
-        return parser.parse_args(["run", *argv])
-    return parser.parse_args(argv)
-
+    normalized_argv = list(argv)
+    if normalized_argv == ["help"]:
+        normalized_argv = ["--help"]
+    elif (
+        len(normalized_argv) == 2
+        and normalized_argv[0] in {"plugin", "session"}
+        and normalized_argv[1] == "help"
+    ):
+        normalized_argv[1] = "--help"
+    if (
+        normalized_argv
+        and normalized_argv[0].startswith("-")
+        and normalized_argv[0] not in {"-h", "--help"}
+    ):
+        return parser.parse_args(["run", *normalized_argv])
+    return parser.parse_args(normalized_argv)

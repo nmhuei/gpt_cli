@@ -64,6 +64,9 @@ DEFAULT_EFFORT = "extended"
 DEFAULT_BRIDGE_NAME: str | None = None
 DEFAULT_MCP_PERMISSION = "read_only"
 DEFAULT_MCP_TUNNEL_FILE = default_mcp_tunnel_file()
+# BQA (botquanganh_mcp) publishes its live Cloudflare tunnel URL here.
+DEFAULT_BQA_TUNNEL_FILE = Path.home() / "GitHub" / "botquanganh_mcp" / "logs" / "tunnel_url.txt"
+BQA_URL_KEYWORD = "bqa"
 
 # Server-Side DAG Recovery Settings
 DEFAULT_RECOVERY_POLL_ATTEMPTS = 10
