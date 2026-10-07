@@ -24,10 +24,15 @@ The tool uses direct HTTP/2 Wire Conduit transport and consumes 0 MB browser RAM
 - Dependencies: `curl_cffi`, `fastapi`, `uvicorn`, `playwright`, `cloakbrowser`.
 
 ```bash
-# Install package dependencies
+# Quick automated installation
+./install.sh
+
+# Or manual installation
+uv venv .venv
+uv pip install -r requirements.txt
 uv pip install -e .
-uv pip install cloakbrowser
 ```
+
 
 ---
 
