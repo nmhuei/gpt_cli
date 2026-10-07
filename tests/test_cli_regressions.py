@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import json
 import os
@@ -11,7 +10,6 @@ repo_root = Path(__file__).resolve().parent.parent
 
 from gpt_cli.cli.main import (
     handle_run,
-    handle_agent,
     handle_session,
     build_cli_parser,
 )
@@ -22,6 +20,18 @@ from gpt_cli.session.logger import SessionLogManager
 from gpt_cli.session.registry import SessionRegistry, SessionLookupError
 from gpt_cli.session.turn_control import TurnControlServer
 from gpt_cli.telemetry.events import TelemetryEvent
+
+
+def test_agent_subcommand_is_not_registered(monkeypatch, capsys):
+    from gpt_cli.cli.main import main
+
+    monkeypatch.setattr(sys, "argv", ["gpt", "agent", "task"])
+    with pytest.raises(SystemExit) as raised:
+        main()
+
+    assert "agent" not in build_cli_parser()._subparsers._group_actions[0].choices
+    assert raised.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 class FakeTransport:
@@ -82,102 +92,10 @@ def test_handle_run_returns_turn_result(tmp_path, monkeypatch):
     assert result.conversation_id == "conv_1"
 
 
-def test_handle_agent_stops_on_failed_initial_turn(tmp_path, monkeypatch, capsys):
-    """handle_agent must stop immediately when initial turn fails."""
-    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
-    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
-
-    call_count = 0
-
-    async def fake_send_turn(self, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return TurnResult(
-            text="Initial turn failed",
-            conversation_id="conv_fail",
-            message_id="msg_fail",
-            model="gpt-5-6-thinking",
-            duration_ms=0,
-            status="failed",
-            error="Upstream network error",
-        )
-
-    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
-    args = build_cli_parser().parse_args(["agent", "--min-runtime-minutes", "10", "failing task"])
-    asyncio.run(handle_agent(args))
-
-    assert call_count == 1
-    out = capsys.readouterr().out
-    assert "Agent stopping due to turn status: failed" in out
 
 
-def test_handle_agent_stops_on_failed_continuation(tmp_path, monkeypatch, capsys):
-    """handle_agent must stop immediately when a continuation turn fails."""
-    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
-    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
-
-    call_count = 0
-
-    async def fake_send_turn(self, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return TurnResult(
-                text="Initial plan",
-                conversation_id="conv_agent",
-                message_id="msg_1",
-                model="gpt-5-6-thinking",
-                duration_ms=1000,
-                status="completed",
-            )
-        return TurnResult(
-            text="Continuation failed",
-            conversation_id="conv_agent",
-            message_id=f"msg_{call_count}",
-            model="gpt-5-6-thinking",
-            duration_ms=0,
-            status="failed",
-            error="HTTP 500",
-        )
-
-    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
-    args = build_cli_parser().parse_args(["agent", "--min-runtime-minutes", "10", "initial task"])
-    asyncio.run(handle_agent(args))
-
-    assert call_count == 2
-    out = capsys.readouterr().out
-    assert "Agent stopping due to turn status: failed" in out
 
 
-def test_handle_agent_json_mode_on_failed_initial_turn(tmp_path, monkeypatch, capsys):
-    """handle_agent in JSON mode must output stopped status on failed initial turn."""
-    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
-    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
-
-    async def fake_send_turn(self, *args, **kwargs):
-        return TurnResult(
-            text="Fail",
-            conversation_id="conv_fail",
-            message_id="msg_fail",
-            model="gpt-5-6-thinking",
-            duration_ms=0,
-            status="failed",
-            error="Bad request",
-        )
-
-    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
-    args = build_cli_parser().parse_args(["agent", "--json", "--min-runtime-minutes", "5", "task"])
-    asyncio.run(handle_agent(args))
-
-    payload = json.loads(capsys.readouterr().out.strip())
-    assert payload["status"] == "stopped"
-    assert payload["runtime_duration_ms"] == 0
 
 
 def test_busy_session_does_not_log_turn(tmp_path, monkeypatch):
@@ -296,18 +214,6 @@ def test_cli_clean_errors_for_missing_sessions(tmp_path):
     assert proc_del.returncode == 1
     assert "Traceback" not in proc_del.stderr
     assert "sess_missing" in proc_del.stderr
-
-    # 8. agent --resume-session nonexistent in JSON mode
-    proc_agent_json = subprocess.run(
-        [sys.executable, "-m", "gpt_cli.cli.main", "agent", "--resume-session", "sess_missing", "--json", "prompt"],
-        capture_output=True, text=True, cwd=str(tmp_path), env=env,
-    )
-    assert proc_agent_json.returncode == 1
-    assert "Traceback" not in proc_agent_json.stderr
-    payload_agent = json.loads(proc_agent_json.stdout.strip())
-    assert payload_agent.get("status") == "error"
-    assert "sess_missing" in payload_agent.get("message", "")
-
 
 def test_run_initial_returns_final_steered_turn(tmp_path):
     """When a steer instruction runs, run_initial must return the latest queued turn result."""
@@ -495,85 +401,6 @@ def test_session_log_events_respects_tail(tmp_path, capsys):
     assert "event_4" in out[1]
 
 
-def test_handle_agent_with_conversation_sets_baseline_turns(tmp_path, monkeypatch):
-    """handle_agent with --conversation must not fail with UnboundLocalError for baseline_turns."""
-    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
-    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
-
-    async def fake_get(*args, **kwargs):
-        class Resp:
-            status_code = 200
-            def json(self):
-                return {"current_node": "node_1", "title": "Conv Title"}
-        return Resp()
-
-    import curl_cffi.requests
-    monkeypatch.setattr(curl_cffi.requests.AsyncSession, "get", fake_get)
-
-    async def fake_send_turn(self, *args, **kwargs):
-        return TurnResult(
-            text="Initial agent output",
-            conversation_id="conv_attach_123",
-            message_id="msg_1",
-            model="gpt-5-6-thinking",
-            duration_ms=50,
-            status="completed",
-        )
-
-    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
-    args = build_cli_parser().parse_args([
-        "agent", "--conversation", "conv_attach_123", "--min-runtime-minutes", "0.0001", "task"
-    ])
-    asyncio.run(handle_agent(args))
-    # Must complete without UnboundLocalError
-
-
-def test_resumed_agent_does_not_count_old_incomplete_log_toward_runtime(tmp_path, monkeypatch):
-    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
-    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
-
-    registry = SessionRegistry()
-    session = registry.create_session(local_id="sess_old_incomplete")
-    registry.checkpoint(session.local_id, "conv_existing", "msg_existing", "gpt-5-6-thinking")
-    SessionLogManager().log_turn(
-        local_id=session.local_id,
-        turn_index=1,
-        prompt="previous attempt",
-        response="partial",
-        model="gpt-5-6-thinking",
-        duration_ms=1000,
-        error="SSE interrupted",
-    )
-
-    call_count = 0
-
-    async def fake_send_turn(self, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return TurnResult(
-            text="completed",
-            conversation_id="conv_existing",
-            message_id=f"msg_{call_count}",
-            model="gpt-5-6-thinking",
-            duration_ms=100,
-            status="completed",
-        )
-
-    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
-    args = build_cli_parser().parse_args([
-        "agent", "--resume-session", session.local_id,
-        "--min-runtime-minutes", "0.003", "continue work",
-    ])
-
-    asyncio.run(handle_agent(args))
-
-    assert call_count == 2
-
-
 def test_normalize_tool_payload_preserves_multiline_bash_and_grep():
     """_normalize_tool_payload must not wrap multiline bash or grep commands in python3 -c."""
     from gpt_cli.server.tool_utils import _normalize_tool_payload
@@ -746,27 +573,6 @@ def test_cli_handles_corrupt_session_registry_cleanly(tmp_path):
 
 
 
-def test_main_handle_agent_remains_compatibility_wrapper(monkeypatch):
-    """main.handle_agent must continue exporting the public compatibility entrypoint."""
-    import gpt_cli.cli.agent_runner as agent_runner
-    import gpt_cli.cli.main as main
-
-    seen = {}
-
-    async def fake_runner(args, *, handle_run):
-        seen["args"] = args
-        seen["handle_run"] = handle_run
-
-    monkeypatch.setattr(agent_runner, "handle_agent", fake_runner)
-
-    async def fake_handle_run(_args):
-        pass
-
-    args = argparse.Namespace()
-    asyncio.run(main.handle_agent(args))
-
-    assert seen["args"] is args
-    assert seen["handle_run"] is main.handle_run
 
 
 def test_cli_delete_session_preserves_other_data_and_rejects_live_race(tmp_path, monkeypatch):

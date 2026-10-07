@@ -45,10 +45,6 @@ async def handle_image(args, **kwargs):
     return await _handlers.handle_image(args, handle_run=handle_run, **kwargs)
 
 
-async def handle_agent(args, **kwargs):
-    return await _handlers.handle_agent(args, handle_run=handle_run, **kwargs)
-
-
 async def handle_research(args, **kwargs):
     return await _handlers.handle_research(args, handle_run=handle_run, **kwargs)
 
@@ -257,6 +253,7 @@ def handle_plugin(args: argparse.Namespace) -> None:
 
 
 def _main() -> None:
+    # Reserve the removed command name so it is not treated as a free-form prompt.
     known_commands = {"run", "agent", "research", "image", "chat", "steer", "session", "plugin", "start", "stop", "restart", "status", "login", "help", "-h", "--help"}
     if len(sys.argv) == 1:
         asyncio.run(interactive_chat())
@@ -286,8 +283,6 @@ def _main() -> None:
     try:
         if args.command == "run":
             asyncio.run(handle_run(args))
-        elif args.command == "agent":
-            asyncio.run(handle_agent(args))
         elif args.command == "research":
             asyncio.run(handle_research(args))
         elif args.command == "image":

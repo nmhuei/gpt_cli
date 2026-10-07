@@ -28,26 +28,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
     run_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
-    # 1b. agent: a bounded continuous session for work that must not end after
-    # a single conversational response.  Keep ordinary `run` one-shot.
-    agent_p = subparsers.add_parser("agent", help="Run one continuous agent session")
-    agent_p.add_argument("-p", "--prompt", default=None, help="Initial task prompt")
-    agent_p.add_argument("pos_prompt", nargs="*", default=[], help="Initial task prompt")
-    agent_resume = agent_p.add_mutually_exclusive_group()
-    agent_resume.add_argument("--resume", action="store_true", help="Continue the active local session")
-    agent_resume.add_argument("-s", "--resume-session", "--session", "--sesion", default=None, help="Continue an existing local session ID")
-    agent_resume.add_argument("--conversation", default=None, help="Attach a ChatGPT Web conversation UUID")
-    agent_p.add_argument("-t", "--tag", default=None, help="Tag for the session")
-    agent_p.add_argument("-m", "--model", default=settings.default_model, help="Model alias")
-    agent_p.add_argument("-e", "--effort", default=settings.default_effort, help="Thinking effort")
-    agent_p.add_argument("-b", "--bridge", default=None, help=f"Active MCP bridge/connector name (default: {settings.default_bridge_name})")
-    agent_p.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
-    agent_p.add_argument(
-        "--min-runtime-minutes", type=float, default=30.0,
-        help="Minimum accumulated upstream turn duration for this session (default: 30)",
-    )
-    agent_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
-
     # Image generation remains a normal conversation turn, but has a focused
     # command and automatically downloads generated image artifacts.
     image_p = subparsers.add_parser("image", help="Generate and save an image")

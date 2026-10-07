@@ -5,9 +5,16 @@ description: Use when running a local gpt CLI agent for a long-lived CTF, revers
 
 # Running GPT-CLI Agents Reliably
 
+GPT-CLI runs a high-autonomy agent from the terminal. Give it a goal; it can
+plan and act across multiple turns with the tools available to its session.
+Its actions remain bounded by the prompt, permissions, and enabled tools.
+
 Use this for long-lived tool work, not a one-turn chat. The durable object is
 one local `session_id` bound to one server-side DAG. Runtime proves service
 availability, not a correct solution.
+
+The `gpt agent` subcommand was removed. Use `gpt run` for one turn, then resume
+the same session explicitly when you need another turn.
 
 **Required reference:** read
 `/home/light/GitHub/gpt_cli/docs/GPT_CLI_60_MINUTE_AGENT_OPERATION.md` before
@@ -27,13 +34,13 @@ a 30+ minute run.
 Use an absolute path and a brief action prompt:
 
 ```bash
-gpt agent -b br -p "solve /absolute/path"
-gpt agent --resume-session sess_x -b br --min-runtime-minutes 30 -p "continue"
+gpt run -b br -p "solve /absolute/path"
+gpt run --resume-session sess_x -b br -p "continue"
 ```
 
-Record the local id immediately. Do not create a replacement session merely
-because SSE resets. `gpt agent` measures provider-visible `duration_ms`, not
-private Chain-of-Thought; judge work through tool events and evidence.
+Record the local id immediately. Each `gpt run` call handles one turn. Do not
+create a replacement session merely because SSE resets. Measure provider-visible
+`duration_ms`; judge work through tool events and evidence, not private reasoning.
 
 ## 60-minute acceptance
 

@@ -16,7 +16,7 @@ wall clock của terminal.
 | Áp lực | Hành vi cũ | Kết luận vận hành |
 |---|---|---|
 | Turn kết thúc sớm | Client trước đây có thể coi SSE reset là failure | Phải để DAG recovery settle trước khi kết luận lỗi. |
-| Chạy liên tục | `gpt agent` chỉ nối bằng prompt `continue` | Thời lượng không chứng minh tiến triển hay solved. |
+| Chạy liên tục | Mỗi `gpt run` chỉ chạy một turn | Resume cùng session; thời lượng không chứng minh tiến triển hay solved. |
 | Token `...`, `???`, `>>>>` | 9--16 giây/turn, 0 tool-call | Token ký hiệu không phải steering đáng tin cậy khi model mất hướng. |
 | BR có full host access | Model tìm được workspace gốc có `solver/result.json` | Prompt cấm đọc không phải sandbox; benchmark đã bị nhiễm phải bỏ. |
 | Candidate flag | Model có thể suy đoán từ artifact/ghi chú cũ | Không submit hoặc đánh dấu solved khi chưa có verifier độc lập. |
@@ -31,12 +31,16 @@ wall clock của terminal.
    hợp lệ; nếu contamination xảy ra, hủy session đó và bắt đầu session sạch.
 3. Gửi prompt mở đầu ngắn nhưng có nghĩa và chỉ rõ absolute path, kết quả cần
    kiểm chứng và BR. Prompt hành động rõ ràng gọi tool tốt hơn token ký hiệu.
-4. Chạy 30 phút trước, sau đó resume **đúng local session** thêm 30 phút:
+4. Dùng `gpt run` cho mỗi turn. Sau khoảng 30 phút, kiểm tra log rồi resume
+   **đúng local session**:
 
    ```bash
-   gpt agent -b br -p "solve /absolute/path"
-   gpt agent --resume-session sess_x -b br --min-runtime-minutes 30 -p "continue"
+   gpt run -b br -p "solve /absolute/path"
+   gpt run --resume-session sess_x -b br -p "continue"
    ```
+
+   Lặp lệnh resume có chủ đích cho đến khi log đạt tổng thời lượng mục tiêu.
+   CLI không còn tự lặp turn đến một runtime budget.
 
 5. Sau mỗi chặng, đọc log; không nhìn transcript chữ đơn thuần:
 

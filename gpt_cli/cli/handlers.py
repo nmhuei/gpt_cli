@@ -71,15 +71,6 @@ async def handle_image(args: argparse.Namespace, handle_run=None) -> None:
         for image_error in result.image_errors:
             print(f"⚠️ Image download failed: {image_error}", file=sys.stderr)
 
-async def handle_agent(args: argparse.Namespace, handle_run=None) -> None:
-    """Compatibility wrapper for the extracted agent runner."""
-    from .agent_runner import handle_agent as _handle_agent
-
-    if handle_run is None:
-        handle_run = globals()["handle_run"]
-    await _handle_agent(args, handle_run=handle_run)
-
-
 async def handle_research(args: argparse.Namespace, handle_run=None) -> None:
     """Run structured deep technical research."""
     from .research_runner import handle_research as _handle_research
@@ -254,4 +245,3 @@ async def handle_login(args: argparse.Namespace) -> None:
         stop_daemon()
         start_daemon()
         print("🔄 Restarted gateway daemon with updated credentials.")
-
