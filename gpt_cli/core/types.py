@@ -45,3 +45,13 @@ class TurnResult:
     lifecycle_status: str | None = None
     image_paths: list[str] = field(default_factory=list)
     image_errors: list[str] = field(default_factory=list)
+
+
+def is_completed_turn(result: TurnResult) -> bool:
+    return (
+        result.status == "completed"
+        and result.lifecycle_status in (None, "completed_turn")
+    ) or (
+        result.status == "terminal"
+        and result.lifecycle_status == "model_terminal"
+    )

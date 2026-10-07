@@ -9,6 +9,27 @@ from ..core.types import TokenBundle
 from ..config import defaults
 from .pow import solve_sentinel_pow, bootstrap_proof_token, PROOF_TOKEN_PREFIX
 
+
+def _safe_error_text(value: Any, limit: int = 300) -> str:
+    """Return bounded diagnostic text without exposing credential-like values."""
+    text = str(value or "")
+    lowered = text.lower()
+    markers = (
+        "bearer ",
+        "token=",
+        "\"token\"",
+        "access_token",
+        "accesstoken",
+        "session-token",
+        "session_token",
+        "api-key",
+        "x-api-key",
+        "cookie",
+    )
+    if any(marker in lowered for marker in markers):
+        return "[redacted credential-bearing error body]"
+    return text[:limit]
+
 class ConduitHandshake:
     """Performs Sentinel chat-requirements check and Conduit turn preparation."""
     
@@ -105,7 +126,6 @@ class ConduitHandshake:
             json={"p": bootstrap},
             timeout=15.0
         )
-        is_prepare_stage = False
         if resp.status_code != 200:
             resp = await session.post(
                 defaults.SENTINEL_CLASSIC_URL,
@@ -113,8 +133,14 @@ class ConduitHandshake:
                 json={"p": bootstrap},
                 timeout=15.0
             )
-            
-        data = resp.json() if resp.status_code == 200 else {}
+
+        if resp.status_code != 200:
+            err_body = _safe_error_text(getattr(resp, "text", ""))
+            raise RuntimeError(
+                f"Sentinel requirements returned HTTP {resp.status_code}: {err_body}"
+            )
+
+        data = resp.json()
         token = data.get("token") or ""
         prepare_token = data.get("prepare_token") or data.get("prepareToken") or ""
 
@@ -139,8 +165,9 @@ class ConduitHandshake:
                 timeout=15.0,
             )
             if fin_resp.status_code != 200:
+                fin_err = _safe_error_text(getattr(fin_resp, "text", ""))
                 raise RuntimeError(
-                    f"Sentinel finalize returned HTTP {fin_resp.status_code}"
+                    f"Sentinel finalize returned HTTP {fin_resp.status_code}: {fin_err}"
                 )
             fin_data = fin_resp.json()
             token = fin_data.get("token") if isinstance(fin_data, dict) else None
@@ -200,6 +227,11 @@ class ConduitHandshake:
         if prep_resp.status_code == 200:
             conduit_data = prep_resp.json()
             conduit_token = conduit_data.get("conduit_token") or conduit_data.get("conduitToken")
+        elif prep_resp.status_code in (401, 403):
+            prep_err = _safe_error_text(getattr(prep_resp, "text", ""))
+            raise RuntimeError(
+                f"Conduit prepare returned HTTP {prep_resp.status_code}: {prep_err}"
+            )
 
         # Step 3: Stream Headers
         final_headers = ConduitHandshake.build_integrity_headers(

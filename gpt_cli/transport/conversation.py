@@ -314,6 +314,10 @@ class ConversationRecovery:
                 # 3. Definite failure on backend
                 if state.message_status in {"failed", "error"}:
                     return state
+            except RuntimeError as exc:
+                msg = str(exc)
+                if any(code in msg for code in ("HTTP 401", "HTTP 403", "HTTP 404")):
+                    raise
             except Exception:
                 pass
 
@@ -352,6 +356,10 @@ class ConversationRecovery:
                     return state
                 if state.message_status in {"failed", "error"}:
                     return state
+            except RuntimeError as exc:
+                msg = str(exc)
+                if any(code in msg for code in ("HTTP 401", "HTTP 403", "HTTP 404")):
+                    raise
             except Exception:
                 pass
             if attempt < max_attempts - 1 and interval_seconds > 0:

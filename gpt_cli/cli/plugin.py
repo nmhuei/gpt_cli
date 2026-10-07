@@ -63,6 +63,12 @@ def handle_plugin(args: argparse.Namespace, plugin_manager_cls=PluginManager) ->
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False))
+    elif args.plugin_action == "remove":
+        print(
+            f"{out['status']}: {out['identifier']}\n"
+            f"  link_deleted={out['link_deleted']}\n"
+            f"  connector_deleted={out['connector_deleted']}"
+        )
     else:
         print(
             f"{out['status']}: {out['name']}\n"

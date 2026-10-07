@@ -1,39 +1,63 @@
-# Core Operating Rules & Engineering Principles
+# Core Operating Rules & Engineering Principles (ASD-STE100 Standard)
 
-## 1. Nguyên Tắc Xác Thực & Xử Lý Lỗi 401/403 (Token & Auth Invariants)
-- **Tài khoản không bao giờ hết hạn quota thông thường:** Tài khoản của người dùng không có giới hạn quota thông thường.
-- **401/403 là LỖI LOGIC GIAO THỨC (99% trường hợp):**
-  Khi gặp mã lỗi `HTTP 401 Unauthorized` hoặc `HTTP 403 Forbidden`, **tuyệt đối không được kết luận do "hết token"** và không được vội vàng kích hoạt headless browser bừa bãi.
-  Nguyên nhân thực tế luôn nằm ở lỗi logic giao tiếp wire:
-  1. *Cookie formatting:* Chuỗi cookie bị thiếu `cf_clearance`, `__Secure-next-auth.session-token`, hoặc `_puid`.
-  2. *Header `ChatGPT-Account-ID`:* Bị thiếu, rỗng, hoặc lệch workspace ID giữa personal và workspace.
-  3. *Sentinel & PoW Logic:* `_SENTINEL_BUILD_HASH` hoặc `oai-client-version` bị backend OpenAI cập nhật; hoặc kết quả giải SHA3-512 bị sai lệch format fingerprint / seed.
-  4. *Device ID Mismatch:* `oai-device-id` không đồng bộ giữa header Sentinel và header SSE stream.
-  5. *TLS / Impersonation:* Fingerprint của `curl_cffi` bị lệch so với User-Agent khai báo.
-  6. *Access Token Expiration:* JWT access token 1-giờ hết hạn nhưng cơ chế refresh token nội bộ chưa tự kích hoạt.
-- **Hành động bắt buộc:** Khi gặp 401/403, phải rà soát và kiểm tra kỹ toàn bộ logic request headers, cookie formatting, PoW handshake, và JWT expiry trước tiên để sửa triệt để mã nguồn.
+## 1. Authentication and Protocol Logic Invariants (HTTP 401/403)
+- **Account Quota Rule:** The user account has unlimited standard quota.
+- **Protocol Fault Rule:** HTTP 401 and HTTP 403 status codes indicate protocol wire errors (99% probability).
+  - Do NOT conclude that quota is exhausted.
+  - Do NOT start a headless browser.
+- **Root Cause Analysis:** Inspect the following items when 401 or 403 occurs:
+  1. *Cookie formatting:* Missing `cf_clearance`, `__Secure-next-auth.session-token`, or `_puid`.
+  2. *Header `ChatGPT-Account-ID`:* Missing, empty, or mismatched workspace identifier.
+  3. *Sentinel and PoW logic:* Outdated `_SENTINEL_BUILD_HASH` or `oai-client-version`; invalid SHA3-512 fingerprint format.
+  4. *Device ID mismatch:* Inconsistent `oai-device-id` between Sentinel and SSE headers.
+  5. *TLS impersonation:* Mismatched `curl_cffi` fingerprint and User-Agent header.
+  6. *Access token expiration:* Expired 1-hour JWT without automatic token refresh.
+- **Mandatory Action:** Correct wire protocol logic, request headers, cookie formatting, PoW handshake, and JWT lifecycle in source code.
 
-## 2. Phân Định Rõ Ràng Codex CLI vs GPT-CLI
+## 2. Separation of System Roles
 - **Codex CLI (`/home/light/.local/bin/codex`):**
-  - Đóng vai trò **Chuyên gia Cố vấn Kiến trúc & Logic (Read-Only Advisor)**.
-  - Tuyệt đối **không yêu cầu Codex code** hoặc sinh code trực tiếp.
+  - Acts as Read-Only Architecture and Logic Advisor.
+  - Do NOT request Codex to generate code or edit files.
 - **GPT-CLI (`/home/light/GitHub/gpt_cli`):**
-  - Mã nguồn sản phẩm runtime Python của hệ thống.
-  - Giao tiếp trực tiếp với backend ChatGPT Web qua Wire Conduit HTTP/2 SSE (0 MB Browser RAM).
-- **Antigravity (AI Assistant):**
-  - Kỹ sư lập trình chịu trách nhiệm triển khai mã nguồn, sửa bug, viết test, và tối ưu hóa hệ thống.
+  - Python runtime product of the local system.
+  - Communicates directly with ChatGPT Web backend via Wire Conduit HTTP/2 SSE (0 MB browser RAM).
+- **Antigravity (AI Coding Assistant):**
+  - Implements source code, debugs faults, writes automated tests, and optimizes systems.
 
-## 3. Tránh Over-Engineering & Chỉ Giải Quyết Lỗi Thực Tế
-- **LoopGuard (Trajectory Hashing):**
-  - Trong thực tế vận hành `gpt-cli`, chưa từng có hiện tượng model kẹt vòng lặp vô hạn hay ảo giác lặp lệnh liên tục. Các turn trước đây bị nhầm là lặp do harness ngắt sớm hoặc session bị khởi động lại.
-  - **Quy tắc:** Không vội vã triển khai các hệ thống LoopGuard / Trajectory Hashing phức tạp gây over-engineering và phình to codebase khi chưa có bằng chứng lỗi thật.
-- **Quản Lý Context Window & DAG:**
-  - `gpt-cli` sử dụng cơ chế Server-Side DAG (`conversation_id`, `parent_message_id`), client không gửi lại toàn bộ lịch sử 50 turns.
-  - Hiện tượng phình context chủ yếu do bùng nổ output của tool (lệnh bash in hàng nghìn dòng). Giải pháp ưu tiên là cắt gọt, vệ sinh đầu vào tool (Tool Output Hygiene) và sử dụng State Checkpointing khi cần, không can thiệp thô bạo vào cây DAG nếu không có nhu cầu.
+## 3. Anti-Over-Engineering and Evidence-Based Debugging
+- **LoopGuard Policy:**
+  - Operating history proves no infinite tool loops occurred.
+  - Do NOT build complex LoopGuard or Trajectory Hashing systems without verified failure evidence.
+- **Context Window Management:**
+  - Systems use Server-Side DAG tracking (`conversation_id`, `parent_message_id`).
+  - Context growth occurs through large tool output text.
+  - Apply Tool Output Hygiene and State Checkpointing.
+  - Do NOT alter Server-Side DAG logic without technical justification.
 
-## 4. Môi Trường Thử Nghiệm & Test Cô Lập (Dành Riêng Cho Antigravity AI Assistant)
-- **Bắt buộc tạo thư mục riêng trong `~/Downloads` khi test:**
-  Khi Antigravity cần chạy thử nghiệm (như test CTF, viết script test tạm thời, tạo POC exploit, sinh mock/dummy data, dựng môi trường sandbox thử nghiệm...):
-  - **Bắt buộc phải tạo một folder riêng biệt bên trong thư mục `~/Downloads`** (ví dụ: `~/Downloads/test_<tên_nhiệm_vụ>/` hoặc `~/Downloads/ctf_test_<tên_challenge>/`) và thực thi toàn bộ thao tác thử nghiệm tại đó.
-  - **Tuyệt đối không tạo file/thư mục rác thử nghiệm trực tiếp tại thư mục gốc của repository** (`/home/light/GitHub/gpt`, `/home/light/GitHub/gpt_cli`, hoặc `~`), nhằm giữ sạch git status và tránh làm ô nhiễm workspace chính.
-  - **Phạm vi áp dụng:** Quy tắc này là chỉ thị vận hành dành riêng cho Antigravity (AI Assistant), không phải logic nội bộ của sản phẩm runtime `gpt-cli`.
+## 4. Isolated Test Environment & Sandbox Rule (bqa-trash)
+- **Mandatory Sandbox Location (`~/Downloads/bqa-trash/`):**
+  1. *Sân chơi nghịch ngợm thoải mái:* Cho phép tải file tạm, chạy script nháp, cào dữ liệu rác, bung file nén trong `~/Downloads/bqa-trash/`.
+  2. *Không bị mất khi tắt máy:* Nằm trên ổ cứng thật nên dữ liệu không bị xóa khi shutdown (ưu điểm hơn `/tmp`).
+  3. *Thùng rác một chạm:* Người dùng có thể xóa sạch toàn bộ thư mục này bất kỳ lúc nào mà không sợ xóa nhầm mã nguồn chính.
+- **Workspace Cleanliness:**
+  - Do NOT create test files or folders in repository roots (`/home/light/GitHub/gpt_cli`, `/home/light/GitHub/botquanganh_mcp`, `/home/light/Workspace/Project/auto_download_ctf_challenge`).
+  - Keep git status clean before and after task execution.
+
+## 5. ASD-STE100 Documentation and Communication Standard
+- **Scope:** All technical documentation, artifacts, guidelines, commit messages, and agent reports MUST comply with ASD-STE100 principles.
+- **Grammar and Vocabulary Rules:**
+  - Write short, direct sentences (< 25 words per sentence).
+  - Use active voice and imperative mood for instructions.
+  - Provide one clear instruction per step.
+  - Avoid ambiguous words, idioms, colloquialisms, and duplicate synonyms.
+  - Use standardized technical terms consistently across all repositories.
+
+## 6. Zero-Hardcoding and Dynamic Extensibility Standard
+- **Configuration Source of Truth:**
+  - All operational thresholds (limits, quotas, timeouts, workers, models, retention days) MUST be loaded from `.env`.
+  - Caching and fallback logic MUST use one unified configuration layer (`app.config` / `settings.py`).
+  - Do NOT embed hardcoded numeric limits or endpoint strings in business logic.
+- **Extensible Components (Platforms, Tools, Plugins, Engines):**
+  - Components that expand over time MUST provide standard base interfaces and declarative templates.
+  - System discovery MUST be automatic (file scanning, entry points, or decorator registration).
+  - Do NOT require manual registry file modifications (such as regex replacements) to add new components.

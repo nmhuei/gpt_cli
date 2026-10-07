@@ -20,14 +20,18 @@ class BrowserLifebuoy:
             session_data = {}
         cookies = await page.context.cookies()
         cookie_dict = {c["name"]: c["value"] for c in cookies}
-        user = session_data.get("user") if isinstance(session_data, dict) else {}
-        user_id = user.get("id") if isinstance(user, dict) else None
+        raw_account_id = session_data.get("account_id") if isinstance(session_data, dict) else None
+        account_id = (
+            raw_account_id
+            if isinstance(raw_account_id, str) and not raw_account_id.startswith("user-")
+            else None
+        )
         return {
             "accessToken": session_data.get("accessToken", "") if isinstance(session_data, dict) else "",
             "cookies": cookie_dict,
             "oaiDeviceId": cookie_dict.get("oai-device-id") or cookie_dict.get("oai-did"),
             "cfClearance": cookie_dict.get("cf_clearance"),
-            "accountId": session_data.get("account_id") or user_id if isinstance(session_data, dict) else None,
+            "accountId": account_id,
         }
 
     async def remint_credentials(self, headless: bool = True, profile_dir: Path | str | None = None) -> TokenBundle:
@@ -101,3 +105,80 @@ class BrowserLifebuoy:
                     await pw_cm.__aexit__(None, None, None)
                 except Exception:
                     pass
+
+    async def interactive_login(
+        self,
+        profile_dir: Path | str | None = None,
+        timeout: int = 300,
+    ) -> TokenBundle:
+        """Purge old profile, launch fresh visible CloakBrowser for login, and extract credentials."""
+        import shutil
+        import time
+
+        profile_path = Path(profile_dir) if profile_dir else self.cache_mgr.cache_dir
+        if profile_path.exists():
+            shutil.rmtree(profile_path, ignore_errors=True)
+        profile_path.mkdir(parents=True, exist_ok=True)
+        self.cache_mgr.cache_file.unlink(missing_ok=True)
+
+        import cloakbrowser
+
+        context = await cloakbrowser.launch_persistent_context_async(
+            str(profile_path),
+            headless=False,
+            stealth_args=True,
+        )
+
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto(
+                defaults.CHATGPT_BASE_URL,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            print("🌐 CloakBrowser opened with fresh profile for ChatGPT Web login.")
+            print("👉 Please log in to your ChatGPT account in the browser.")
+            print("⏳ Waiting for login session...")
+
+            start_time = time.time()
+
+            while time.time() - start_time < timeout:
+                await asyncio.sleep(2)
+                is_closed = False
+                if hasattr(page, "is_closed"):
+                    res = page.is_closed()
+                    is_closed = await res if asyncio.iscoroutine(res) else bool(res)
+                if not context.pages or is_closed:
+                    print("⚠️ Browser window closed.")
+                    break
+
+                try:
+                    data = await self._extract_from_page(page)
+                except Exception:
+                    continue
+
+                token = data.get("accessToken") or ""
+                if not token or self.cache_mgr.is_token_expired(token):
+                    continue
+
+                cookies = data.get("cookies", {})
+                account_id = data.get("accountId") or self.cache_mgr.extract_account_id(token)
+                bundle = TokenBundle(
+                    access_token=token,
+                    cookies=cookies,
+                    oai_device_id=data.get("oaiDeviceId") or cookies.get("oai-device-id"),
+                    cf_clearance=data.get("cfClearance") or cookies.get("cf_clearance"),
+                    chatgpt_account_id=account_id,
+                )
+                self.cache_mgr.save_disk_cache(bundle)
+                print(f"✅ Login successful. Fresh credentials saved to token cache (Account: {account_id or 'personal'}).")
+                await asyncio.sleep(2)
+                return bundle
+
+            raise RuntimeError("Login timed out or browser was closed before login completed.")
+        finally:
+            await context.close()
+
+
+

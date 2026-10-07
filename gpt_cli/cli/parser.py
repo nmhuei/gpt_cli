@@ -54,6 +54,24 @@ def build_cli_parser() -> argparse.ArgumentParser:
     image_p.add_argument("-p", "--prompt", required=True, help="Image description")
     image_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
+    # 1c. research: specialized deep research mode
+    research_p = subparsers.add_parser("research", help="Run structured deep research on any technical topic or code")
+    research_p.add_argument("-p", "--prompt", default=None, help="Research topic or question")
+    research_p.add_argument("pos_prompt", nargs="*", default=[], help="Research topic or question")
+    research_p.add_argument("--deep", action="store_true", help="Enable multi-phase iterative deep research")
+    research_p.add_argument("--turns", type=int, default=None, help="Number of research iterations (default: 3 with --deep, 1 otherwise)")
+    research_p.add_argument("-o", "--output", "--report", dest="report_file", default=None, help="Save final synthesized report to markdown file")
+    research_resume = research_p.add_mutually_exclusive_group()
+    research_resume.add_argument("--resume", action="store_true", help="Continue the active local session")
+    research_resume.add_argument("-s", "--resume-session", "--session", "--sesion", default=None, help="Continue an existing local session ID")
+    research_resume.add_argument("--conversation", default=None, help="Attach a ChatGPT Web conversation UUID")
+    research_p.add_argument("-t", "--tag", default=None, help="Tag for the session")
+    research_p.add_argument("-m", "--model", default=settings.default_model, help="Model alias")
+    research_p.add_argument("-e", "--effort", default=None, help="Thinking effort")
+    research_p.add_argument("-b", "--bridge", default=None, help=f"Active MCP bridge/connector name (default: {settings.default_bridge_name})")
+    research_p.add_argument("--no-bridge", action="store_true", help="Disable auto-bridge routing")
+    research_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
     # 2. chat (interactive)
     chat_p = subparsers.add_parser("chat", help="Start interactive terminal chat session")
     chat_resume = chat_p.add_mutually_exclusive_group()
@@ -97,6 +115,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     # session delete
     del_p = sess_sub.add_parser("delete", help="Delete a session")
     del_p.add_argument("session_id", help="Local session ID")
+    del_p.add_argument("--json", action="store_true", help="Output JSON")
 
     # 4. steer an existing live turn
     steer_p = subparsers.add_parser("steer", help="Add an instruction to one running local session")
@@ -144,7 +163,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
 
     status_p = subparsers.add_parser("status", help="Check gateway daemon status")
     status_p.add_argument("--json", action="store_true", help="Output JSON")
+
+    # 7. Browser login
+    login_p = subparsers.add_parser("login", help="Open visible browser to log in to ChatGPT Web and refresh credentials")
+    login_p.add_argument("--timeout", type=int, default=300, help="Maximum seconds to wait for login (default: 300)")
     return parser
+
 
 
 def parse_cli_args(argv: list[str]) -> argparse.Namespace:

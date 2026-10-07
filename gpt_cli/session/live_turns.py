@@ -21,6 +21,10 @@ class NoLiveTurnError(LookupError):
     """Raised when a requested live session no longer has an owner."""
 
 
+class LiveTurnRegistryCorruptionError(RuntimeError):
+    """Raised when live-turn state cannot be safely read."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -105,10 +109,32 @@ class LiveTurnRegistry:
     def _load(self) -> None:
         try:
             raw = self.state_file.read_text(encoding="utf-8").strip()
-            parsed = json.loads(raw) if raw else {"turns": {}}
-            self._data = parsed if isinstance(parsed, dict) and isinstance(parsed.get("turns"), dict) else {"turns": {}}
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
             self._data = {"turns": {}}
+            return
+        except UnicodeDecodeError as exc:
+            raise LiveTurnRegistryCorruptionError(
+                f"Corrupt live-turn registry encoding: {self.state_file}"
+            ) from exc
+        except OSError as exc:
+            raise LiveTurnRegistryCorruptionError(
+                f"Unable to read live-turn registry {self.state_file}"
+            ) from exc
+        try:
+            if not raw:
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: {self.state_file}"
+                )
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise LiveTurnRegistryCorruptionError(
+                f"Corrupt live-turn registry: {self.state_file}"
+            ) from exc
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("turns"), dict):
+            raise LiveTurnRegistryCorruptionError(
+                f"Corrupt live-turn registry: {self.state_file}"
+            )
+        self._data = parsed
 
     def _save(self) -> None:
         tmp_path = self.runtime_dir / f".live_turns.{uuid.uuid4().hex}.tmp"
@@ -128,7 +154,14 @@ class LiveTurnRegistry:
             raise ValueError("missing live-turn owner")
         owner = TurnOwner(**owner_raw)
         queue_raw = raw.get("queue")
-        queue = [QueuedSteer(**entry) for entry in queue_raw if isinstance(entry, dict)] if isinstance(queue_raw, list) else []
+        if queue_raw is None:
+            queue = []
+        elif not isinstance(queue_raw, list):
+            raise ValueError("invalid live-turn queue")
+        else:
+            if any(not isinstance(entry, dict) for entry in queue_raw):
+                raise ValueError("invalid live-turn queue entry")
+            queue = [QueuedSteer(**entry) for entry in queue_raw]
         return LiveTurnRecord(
             session_id=str(raw["session_id"]),
             owner=owner,
@@ -156,16 +189,26 @@ class LiveTurnRegistry:
         assert isinstance(turns, dict)
         stale_ids: list[str] = []
         for session_id, raw in list(turns.items()):
+            if not isinstance(raw, dict):
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                )
             try:
-                record = self._record_from_raw(raw) if isinstance(raw, dict) else None
-            except (TypeError, ValueError):
-                record = None
+                record = self._record_from_raw(raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                ) from exc
             if record is not None and self._owner_alive(record.owner):
                 continue
             stale_ids.append(str(session_id))
             if record is not None:
                 try:
                     Path(record.owner.socket_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    (self.runtime_dir / f"{session_id}.sock").unlink(missing_ok=True)
                 except OSError:
                     pass
             del turns[session_id]
@@ -209,7 +252,18 @@ class LiveTurnRegistry:
             raw = turns.get(session_id)
             if changed:
                 self._save()
-            return self._record_from_raw(raw) if isinstance(raw, dict) else None
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                )
+            try:
+                return self._record_from_raw(raw)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                ) from exc
 
     def list_live(self) -> list[LiveTurnRecord]:
         with self._lock():
@@ -217,7 +271,12 @@ class LiveTurnRegistry:
             changed = bool(self._cleanup_stale_loaded())
             turns = self._data["turns"]
             assert isinstance(turns, dict)
-            records = [self._record_from_raw(raw) for raw in turns.values() if isinstance(raw, dict)]
+            try:
+                records = [self._record_from_raw(raw) for raw in turns.values()]
+            except (TypeError, ValueError, KeyError) as exc:
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                ) from exc
             if changed:
                 self._save()
             return records
@@ -225,9 +284,13 @@ class LiveTurnRegistry:
     def _require_raw(self, session_id: str) -> dict[str, object]:
         turns = self._data["turns"]
         assert isinstance(turns, dict)
-        raw = turns.get(session_id)
-        if not isinstance(raw, dict):
+        if session_id not in turns:
             raise NoLiveTurnError(f"No live turn for local session: {session_id}")
+        raw = turns[session_id]
+        if not isinstance(raw, dict):
+            raise LiveTurnRegistryCorruptionError(
+                f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+            )
         return raw
 
     def enqueue(self, session_id: str, request_id: str, prompt: str) -> QueuedSteer:
@@ -236,12 +299,17 @@ class LiveTurnRegistry:
             raise ValueError("Steer prompt must not be empty")
         with self._lock():
             self._load()
-            self._cleanup_stale_loaded()
+            if self._cleanup_stale_loaded():
+                self._save()
             raw = self._require_raw(session_id)
             queue = raw.setdefault("queue", [])
             assert isinstance(queue, list)
             for entry in queue:
-                if isinstance(entry, dict) and entry.get("request_id") == request_id:
+                if not isinstance(entry, dict):
+                    raise LiveTurnRegistryCorruptionError(
+                        f"Corrupt live-turn registry: invalid queued steer entry in {self.state_file}"
+                    )
+                if entry.get("request_id") == request_id:
                     return QueuedSteer(**entry)
             queued = QueuedSteer(request_id=request_id, prompt=clean_prompt, accepted_at=_utc_now())
             queue.append(asdict(queued))
@@ -251,12 +319,17 @@ class LiveTurnRegistry:
     def claim_next_queued(self, session_id: str) -> QueuedSteer | None:
         with self._lock():
             self._load()
-            self._cleanup_stale_loaded()
+            if self._cleanup_stale_loaded():
+                self._save()
             raw = self._require_raw(session_id)
             queue = raw.setdefault("queue", [])
             assert isinstance(queue, list)
             for entry in queue:
-                if isinstance(entry, dict) and entry.get("state") == "queued":
+                if not isinstance(entry, dict):
+                    raise LiveTurnRegistryCorruptionError(
+                        f"Corrupt live-turn registry: invalid queued steer entry in {self.state_file}"
+                    )
+                if entry.get("state") == "queued":
                     entry["state"] = "claimed"
                     self._save()
                     return QueuedSteer(**entry)
@@ -269,7 +342,11 @@ class LiveTurnRegistry:
             queue = raw.setdefault("queue", [])
             assert isinstance(queue, list)
             for index, entry in enumerate(queue):
-                if isinstance(entry, dict) and entry.get("request_id") == request_id and entry.get("state") == "claimed":
+                if not isinstance(entry, dict):
+                    raise LiveTurnRegistryCorruptionError(
+                        f"Corrupt live-turn registry: invalid queued steer entry in {self.state_file}"
+                    )
+                if entry.get("request_id") == request_id and entry.get("state") == "claimed":
                     del queue[index]
                     self._save()
                     return
@@ -282,14 +359,19 @@ class LiveTurnRegistry:
             raw = self._require_raw(session_id)
             queue = raw.get("queue", [])
             if not isinstance(queue, list):
-                return []
-            return [
-                prompt
-                for entry in queue
-                if isinstance(entry, dict)
-                and isinstance((prompt := entry.get("prompt")), str)
-                and prompt.strip()
-            ]
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid steer queue in {self.state_file}"
+                )
+            prompts = []
+            for entry in queue:
+                if not isinstance(entry, dict):
+                    raise LiveTurnRegistryCorruptionError(
+                        f"Corrupt live-turn registry: invalid queued steer entry in {self.state_file}"
+                    )
+                prompt = entry.get("prompt")
+                if isinstance(prompt, str) and prompt.strip():
+                    prompts.append(prompt)
+            return prompts
 
     def update_upstream(
         self,
@@ -318,14 +400,62 @@ class LiveTurnRegistry:
             self._save()
             return self._record_from_raw(raw)
 
+    def update_socket_path(self, session_id: str, owner_id: str, socket_path: str | Path) -> bool:
+        with self._lock():
+            self._load()
+            turns = self._data.get("turns")
+            if not isinstance(turns, dict):
+                return False
+            if session_id not in turns:
+                return False
+            raw = turns[session_id]
+            if not isinstance(raw, dict):
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                )
+            owner_raw = raw.get("owner")
+            if owner_raw is not None and not isinstance(owner_raw, dict):
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid owner entry in {self.state_file}"
+                )
+            if isinstance(owner_raw, dict) and owner_raw.get("owner_id") == owner_id:
+                owner_raw["socket_path"] = str(socket_path)
+                self._save()
+                return True
+            return False
+
+    def has_live(self, session_id: str) -> bool:
+        """Return whether a live owner currently exists after stale cleanup."""
+        return self.get_live(session_id) is not None
+
+    def delete_if_idle(self, session_id: str, delete_callback) -> bool:
+        """Run deletion while holding the live-turn lock so a new claim cannot race it."""
+        with self._lock():
+            self._load()
+            changed = bool(self._cleanup_stale_loaded())
+            turns = self._data["turns"]
+            assert isinstance(turns, dict)
+            if session_id in turns:
+                if changed:
+                    self._save()
+                raise SessionBusyError(f"Cannot delete live session: {session_id}")
+            deleted = delete_callback()
+            if changed:
+                self._save()
+            return deleted
+
     def release(self, session_id: str, owner_id: str) -> bool:
         with self._lock():
             self._load()
             turns = self._data["turns"]
             assert isinstance(turns, dict)
             raw = turns.get(session_id)
-            if not isinstance(raw, dict):
+            if raw is None:
                 return False
+            if not isinstance(raw, dict):
+                raise LiveTurnRegistryCorruptionError(
+                    f"Corrupt live-turn registry: invalid live turn entry in {self.state_file}"
+                )
             record = self._record_from_raw(raw)
             if record.owner.owner_id != owner_id:
                 return False
@@ -333,6 +463,10 @@ class LiveTurnRegistry:
             self._save()
             try:
                 Path(record.owner.socket_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                (self.runtime_dir / f"{session_id}.sock").unlink(missing_ok=True)
             except OSError:
                 pass
             return True

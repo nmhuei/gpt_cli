@@ -17,11 +17,23 @@ class SessionLookupError(LookupError):
     """Raised when an explicit resume target does not exist."""
 
 
+class SessionRegistryCorruptionError(RuntimeError):
+    """Raised when the persisted registry cannot be parsed safely."""
+
+
+class SessionDeleteError(RuntimeError):
+    """Raised when local session cleanup fails before metadata removal."""
+
+
+class SessionPartialDeleteError(RuntimeError):
+    """Raised when logs are removed but registry metadata could not be saved."""
+
+
 class SessionRegistry:
     """Manages tool-created sessions stored in tool_sessions.json with process-safe file locking."""
 
     def __init__(self, storage_dir: Path | str | None = None):
-        self.storage_dir = Path(storage_dir or defaults.DEFAULT_SESSION_DIR).expanduser()
+        self.storage_dir = Path(storage_dir or os.getenv("WEBGPT_SESSION_DIR") or defaults.DEFAULT_SESSION_DIR).expanduser()
         self.storage_file = self.storage_dir / "tool_sessions.json"
         self.lock_file = self.storage_dir / ".tool_sessions.lock"
         self._rlock = threading.RLock()
@@ -34,13 +46,22 @@ class SessionRegistry:
     def _lock(self):
         with self._rlock:
             if self._lock_count == 0:
+                lock_handle = None
                 try:
                     self.storage_dir.mkdir(parents=True, exist_ok=True)
-                    f = open(self.lock_file, "a+")
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    self._flock_fd = f
-                except OSError:
+                    lock_handle = open(self.lock_file, "a+")
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                except OSError as exc:
+                    if lock_handle is not None:
+                        try:
+                            lock_handle.close()
+                        except OSError:
+                            pass
                     self._flock_fd = None
+                    raise OSError(
+                        f"Failed to acquire session registry lock at {self.lock_file}"
+                    ) from exc
+                self._flock_fd = lock_handle
             self._lock_count += 1
             try:
                 yield
@@ -60,14 +81,90 @@ class SessionRegistry:
             try:
                 content = self.storage_file.read_text(encoding="utf-8").strip()
                 if content:
-                    self._data = json.loads(content)
+                    loaded = json.loads(content)
+                    self._validate_loaded_data(loaded)
+                    self._data = loaded
                 else:
-                    self._data = {"active_id": None, "sessions": {}}
-            except Exception:
-                if not self._data or not self._data.get("sessions"):
-                    self._data = {"active_id": None, "sessions": {}}
+                    raise SessionRegistryCorruptionError(
+                        f"Corrupt session registry: empty file {self.storage_file}. "
+                        "Repair or remove the file explicitly before continuing."
+                    )
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                # Do not replace malformed persisted state with an empty registry.
+                # The bytes on disk are the evidence needed for recovery.
+                raise SessionRegistryCorruptionError(
+                    f"Corrupt session registry: {self.storage_file}. "
+                    "Repair or remove the file explicitly before continuing."
+                ) from exc
         else:
             self._data = {"active_id": None, "sessions": {}}
+
+    def _validate_loaded_data(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            raise SessionRegistryCorruptionError(
+                f"Corrupt session registry: expected object root in {self.storage_file}."
+            )
+
+        sessions = data.get("sessions")
+        if not isinstance(sessions, dict):
+            raise SessionRegistryCorruptionError(
+                f"Corrupt session registry: expected sessions mapping in {self.storage_file}."
+            )
+
+        active_id = data.get("active_id")
+        if active_id is not None and not isinstance(active_id, str):
+            raise SessionRegistryCorruptionError(
+                f"Corrupt session registry: invalid active session in {self.storage_file}."
+            )
+
+        for local_id, record in sessions.items():
+            if not isinstance(local_id, str) or not isinstance(record, dict):
+                raise SessionRegistryCorruptionError(
+                    f"Corrupt session registry: invalid session record in {self.storage_file}."
+                )
+            if record.get("local_id") != local_id:
+                raise SessionRegistryCorruptionError(
+                    f"Corrupt session registry: invalid session record in {self.storage_file}."
+                )
+
+            invalid = (
+                ("local_id", str, False),
+                ("conversation_id", str, True),
+                ("last_message_id", str, True),
+                ("tag", str, True),
+                ("model", str, True),
+                ("bqa_chat_id", str, True),
+                ("bqa_workspace_path", str, True),
+                ("created_at", str, False),
+                ("updated_at", str, False),
+                ("turns", int, False),
+            )
+            for field_name, field_type, optional in invalid:
+                if field_name in record:
+                    value = record[field_name]
+                    if (optional and value is not None and not isinstance(value, field_type)) or (
+                        not optional and not isinstance(value, field_type)
+                    ):
+                        raise SessionRegistryCorruptionError(
+                            f"Corrupt session registry: invalid session record in {self.storage_file}."
+                        )
+            if "turns" in record and (not isinstance(record["turns"], int) or isinstance(record["turns"], bool)):
+                raise SessionRegistryCorruptionError(
+                    f"Corrupt session registry: invalid session record in {self.storage_file}."
+                )
+            if "pending_steers" in record and (
+                not isinstance(record["pending_steers"], list)
+                or any(not isinstance(prompt, str) for prompt in record["pending_steers"])
+            ):
+                raise SessionRegistryCorruptionError(
+                    f"Corrupt session registry: invalid session record in {self.storage_file}."
+                )
+            try:
+                SessionRecord(**record)
+            except TypeError as exc:
+                raise SessionRegistryCorruptionError(
+                    f"Corrupt session registry: invalid session record in {self.storage_file}."
+                ) from exc
 
     def _save(self) -> None:
         try:
@@ -82,8 +179,10 @@ class SessionRegistry:
                         tmp_file.unlink(missing_ok=True)
                     except Exception:
                         pass
-        except OSError:
-            pass
+        except OSError as exc:
+            raise OSError(
+                f"Failed to persist session registry at {self.storage_file}"
+            ) from exc
 
     def get_active(self) -> SessionRecord | None:
         with self._lock():

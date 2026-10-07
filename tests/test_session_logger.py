@@ -83,3 +83,91 @@ def test_format_readable_log(tmp_path: Path):
     assert "TURN #1" in formatted
     assert "Test question" in formatted
     assert "Test answer" in formatted
+
+
+def test_format_readable_log_appends_tool_durations_without_removing_payload_or_result(tmp_path: Path):
+    log_mgr = SessionLogManager(base_dir=tmp_path)
+    session_id = "sess_tool_duration"
+    log_mgr.log_turn(
+        local_id=session_id,
+        turn_index=1,
+        prompt="Test",
+        response="Done",
+        model="gpt-5-6-thinking",
+        duration_ms=10,
+        conversation_id="conv",
+        message_id="msg",
+        tool_calls=[{
+            "tool": "terminal_execute",
+            "payload": "rm -rf secret",
+            "result": {"secret": "output"},
+            "client_elapsed_ms": 0,
+            "server_duration_ms": 12,
+        }],
+    )
+
+    formatted = log_mgr.format_readable_log(session_id)
+    assert "client 0 ms" in formatted
+    assert "server 12 ms" in formatted
+    assert "rm -rf secret" in formatted
+    assert "secret" in formatted
+
+
+
+def test_format_readable_log_preserves_tool_context_with_concise_timings_and_caps_results(tmp_path: Path):
+    log_mgr = SessionLogManager(base_dir=tmp_path)
+    session_id = "sess_tool_context"
+    log_mgr.log_turn(
+        local_id=session_id,
+        turn_index=1,
+        prompt="Test",
+        response="Done",
+        model="gpt-5-6-thinking",
+        duration_ms=10,
+        conversation_id="conv",
+        message_id="msg",
+        tool_calls=[{
+            "tool": "terminal_execute",
+            "payload": "echo hello",
+            "result": {"output": "hello"},
+            "client_elapsed_ms": 0,
+            "server_duration_ms": 12,
+        }],
+    )
+
+    formatted = log_mgr.format_readable_log(session_id)
+    assert "echo hello" in formatted
+    assert "hello" in formatted
+    assert "client 0 ms" in formatted
+    assert "server 12 ms" in formatted
+
+
+def test_tool_timing_fields_remain_in_json_history(tmp_path: Path):
+    log_mgr = SessionLogManager(base_dir=tmp_path)
+    session_id = "sess_tool_json_timing"
+
+    log_mgr.log_turn(
+        local_id=session_id,
+        turn_index=1,
+        prompt="Test",
+        response="Done",
+        model="gpt-5-6-thinking",
+        duration_ms=10,
+        conversation_id="conv",
+        message_id="msg",
+        tool_calls=[{
+            "tool": "terminal_execute",
+            "payload": "echo hello",
+            "result": {"output": "hello"},
+            "client_elapsed_ms": 0,
+            "server_duration_ms": 25,
+        }],
+    )
+
+    raw = (tmp_path / session_id / "history.jsonl").read_text(encoding="utf-8")
+    record = json.loads(raw.splitlines()[0])
+    tool = record["tool_calls"][0]
+
+    assert tool["client_elapsed_ms"] == 0
+    assert tool["server_duration_ms"] == 25
+    assert tool["result"] == {"output": "hello"}

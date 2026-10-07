@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -9,10 +11,52 @@ class SessionLogManager:
     """Manages persistent turn transcripts, prompt/response pairs, and raw telemetry per session."""
 
     def __init__(self, base_dir: Path | str | None = None):
-        self.base_dir = Path(base_dir or defaults.DEFAULT_SESSION_DIR).expanduser()
+        self.base_dir = Path(base_dir or os.getenv("WEBGPT_SESSION_DIR") or defaults.DEFAULT_SESSION_DIR).expanduser()
+
+    def _validate_local_id(self, local_id: str) -> str:
+        if not isinstance(local_id, str) or not local_id:
+            raise ValueError(f"Invalid session log path: {local_id}")
+        if Path(local_id).name != local_id or local_id in {".", ".."}:
+            raise ValueError(f"Invalid session log path: {local_id}")
+        if any(part in {".", ".."} for part in Path(local_id).parts):
+            raise ValueError(f"Invalid session log path: {local_id}")
+        return local_id
 
     def session_dir(self, local_id: str) -> Path:
-        return self.base_dir / local_id
+        self._validate_local_id(local_id)
+        candidate = self.base_dir / local_id
+        resolved_base = self.base_dir.resolve()
+        resolved_candidate = candidate.resolve()
+        try:
+            resolved_candidate.relative_to(resolved_base)
+        except ValueError as exc:
+            raise ValueError(f"Invalid session log path: {local_id}") from exc
+        if resolved_candidate == resolved_base:
+            raise ValueError(f"Invalid session log path: {local_id}")
+        return candidate
+
+    def delete_session_logs(self, local_id: str) -> bool:
+        """Delete only this session's local log directory.
+
+        The registry owns session metadata; this removes the matching log payload only.
+        """
+        session_dir = self.session_dir(local_id)
+        if not session_dir.exists():
+            return False
+
+        def _on_rm_error(func, path, exc_info):
+            import stat
+            try:
+                os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+                func(path)
+            except Exception:
+                pass
+
+        try:
+            shutil.rmtree(session_dir, on_exc=_on_rm_error)
+        except TypeError:
+            shutil.rmtree(session_dir, onerror=_on_rm_error)
+        return not session_dir.exists()
 
     def log_turn(
         self,
@@ -96,10 +140,20 @@ class SessionLogManager:
                     pass
         return events
 
-    def format_readable_log(self, local_id: str, max_turns: int | None = None) -> str:
+    def format_readable_log(
+        self,
+        local_id: str,
+        max_turns: int | None = None,
+        turn_index: int | None = None,
+    ) -> str:
         history = self.get_history(local_id)
         if not history:
             return f"No logged history found for session {local_id}."
+
+        if turn_index is not None:
+            history = [h for h in history if h.get("turn_index") == turn_index]
+            if not history:
+                return f"No logged history found for turn #{turn_index} in session {local_id}."
 
         if max_turns is not None:
             history = history[-max_turns:]
@@ -138,9 +192,20 @@ class SessionLogManager:
                 lines.append("TOOL CALLS:")
                 for tc in tool_calls:
                     source = f" [{tc['source']}]" if tc.get("source") else ""
+                    timings = []
+                    for label, key in (("client", "client_elapsed_ms"), ("server", "server_duration_ms")):
+                        value = tc.get(key)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                            timings.append(f"{label} {value:g} ms")
+                    suffix = f" ({', '.join(timings)})" if timings else ""
+                    payload = tc.get("payload")
                     result = tc.get("result")
-                    suffix = "" if result is None else f" → {str(result)[:240]}"
-                    lines.append(f"  ⚡ {tc.get('tool')}{source}: {tc.get('payload')}{suffix}")
+                    context = ""
+                    if payload is not None:
+                        context += f": {str(payload)[:240]}"
+                    if result is not None:
+                        context += f" → {str(result)[:240]}"
+                    lines.append(f"  ⚡ {tc.get('tool')}{source}{context}{suffix}")
                 lines.append("")
 
             lines.append(f"RESPONSE:\n  {h.get('response', '').strip()}")

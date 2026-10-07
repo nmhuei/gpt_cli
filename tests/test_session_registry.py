@@ -1,7 +1,66 @@
 import pytest
 from pathlib import Path
 from gpt_cli.session.models import SessionRecord
-from gpt_cli.session.registry import SessionLookupError, SessionRegistry
+from gpt_cli.session.registry import SessionLookupError, SessionRegistry, SessionRegistryCorruptionError
+
+
+def test_corrupt_registry_raises_and_preserves_bytes(tmp_path: Path):
+    """A malformed registry must stop startup and leave evidence untouched."""
+    reg = SessionRegistry(storage_dir=tmp_path)
+    reg.create_session(local_id="stale_session")
+
+    corrupted = b"{not valid json"
+    reg.storage_file.write_bytes(corrupted)
+
+    with pytest.raises(SessionRegistryCorruptionError, match="Corrupt session registry"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert reg.storage_file.read_bytes() == corrupted
+
+
+def test_empty_existing_registry_is_corruption_and_preserves_bytes(tmp_path: Path):
+    registry_file = tmp_path / "tool_sessions.json"
+    registry_file.write_bytes(b"")
+
+    with pytest.raises(SessionRegistryCorruptionError, match="Corrupt session registry"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert registry_file.read_bytes() == b""
+
+
+def test_session_creation_reports_storage_failure_and_preserves_previous_registry(tmp_path: Path, monkeypatch):
+    reg = SessionRegistry(storage_dir=tmp_path)
+    reg.create_session(local_id="sess_existing")
+    saved_bytes = reg.storage_file.read_bytes()
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("disk is read-only")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("gpt_cli.session.registry.os.replace", fail_replace)
+        with pytest.raises(OSError, match="Failed to persist session registry"):
+            reg.create_session(local_id="sess_unsaved")
+
+    assert reg.storage_file.read_bytes() == saved_bytes
+    reloaded = SessionRegistry(storage_dir=tmp_path)
+    assert reloaded.get_session("sess_existing") is not None
+    assert reloaded.get_session("sess_unsaved") is None
+
+
+def test_registry_write_fails_closed_when_process_lock_cannot_be_acquired(tmp_path: Path, monkeypatch):
+    registry = SessionRegistry(storage_dir=tmp_path)
+
+    def fail_flock(*_args, **_kwargs):
+        raise OSError("lock unavailable")
+
+    monkeypatch.setattr("gpt_cli.session.registry.fcntl.flock", fail_flock)
+
+    with pytest.raises(OSError, match="Failed to acquire session registry lock") as exc_info:
+        registry.create_session(local_id="must_not_write")
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == "lock unavailable"
+    assert not registry.storage_file.exists()
 
 def test_session_creation_and_continuity(tmp_path: Path):
     reg = SessionRegistry(storage_dir=tmp_path)
@@ -113,3 +172,99 @@ def test_concurrent_session_registry_writers(tmp_path: Path):
     verify_reg = SessionRegistry(storage_dir=storage_dir)
     sessions = verify_reg.list_sessions()
     assert len(sessions) == 20, f"Expected 20 sessions, got {len(sessions)}"
+
+
+def test_wrong_root_shape_raises_and_preserves_bytes(tmp_path: Path):
+    corrupted = b"[]"
+    registry_file = tmp_path / "tool_sessions.json"
+    registry_file.write_bytes(corrupted)
+
+    with pytest.raises(SessionRegistryCorruptionError, match="expected object root"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert registry_file.read_bytes() == corrupted
+
+
+def test_wrong_sessions_shape_raises_and_preserves_bytes(tmp_path: Path):
+    corrupted = b'{"active_id": null, "sessions": []}'
+    registry_file = tmp_path / "tool_sessions.json"
+    registry_file.write_bytes(corrupted)
+
+    with pytest.raises(SessionRegistryCorruptionError, match="expected sessions mapping"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert registry_file.read_bytes() == corrupted
+
+
+def test_wrong_session_record_shape_raises_and_preserves_bytes(tmp_path: Path):
+    corrupted = b'{"active_id": "sess_bad", "sessions": {"sess_bad": {"turns": "wrong"}}}'
+    registry_file = tmp_path / "tool_sessions.json"
+    registry_file.write_bytes(corrupted)
+
+    with pytest.raises(SessionRegistryCorruptionError, match="invalid session record"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert registry_file.read_bytes() == corrupted
+
+
+def test_wrong_typed_turns_with_valid_local_id_raises_and_preserves_bytes(tmp_path: Path):
+    corrupted = b'{"active_id": "sess_bad", "sessions": {"sess_bad": {"local_id": "sess_bad", "turns": "wrong"}}}'
+    registry_file = tmp_path / "tool_sessions.json"
+    registry_file.write_bytes(corrupted)
+
+    with pytest.raises(SessionRegistryCorruptionError, match="invalid session record"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert registry_file.read_bytes() == corrupted
+
+
+def test_wrong_active_id_type_raises_and_preserves_bytes(tmp_path: Path):
+    corrupted = b'{"active_id": [], "sessions": {}}'
+    registry_file = tmp_path / "tool_sessions.json"
+    registry_file.write_bytes(corrupted)
+
+    with pytest.raises(SessionRegistryCorruptionError, match="invalid active session"):
+        SessionRegistry(storage_dir=tmp_path)
+
+    assert registry_file.read_bytes() == corrupted
+
+
+def test_delete_session_removes_only_local_logs(tmp_path: Path):
+    from gpt_cli.session.logger import SessionLogManager
+
+    logs = tmp_path / "logs"
+    manager = SessionLogManager(logs)
+    manager.log_turn("sess_keep", 1, "keep", "keep", "model", 1)
+    manager.log_turn("sess_delete", 1, "delete", "delete", "model", 1)
+
+    reg = SessionRegistry(storage_dir=tmp_path / "registry")
+    reg.create_session(local_id="sess_delete")
+    reg.create_session(local_id="sess_keep")
+
+    assert reg.delete_session("sess_delete") is True
+    assert manager.get_history("sess_keep")
+    assert manager.get_history("sess_delete")
+
+    assert manager.delete_session_logs("sess_delete") is True
+    assert manager.get_history("sess_keep")
+    assert manager.get_history("sess_delete") == []
+
+
+def test_session_log_delete_allows_only_single_safe_component(tmp_path: Path):
+    from gpt_cli.session.logger import SessionLogManager
+    manager = SessionLogManager(tmp_path / "logs")
+    for bad in [".", "./", "nested/..", "a/b", ".."]:
+        try:
+            manager.session_dir(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe id accepted: {bad}")
+
+
+def test_second_delete_is_not_success(tmp_path: Path):
+    from gpt_cli.session.logger import SessionLogManager
+    manager = SessionLogManager(tmp_path / "logs")
+    manager.log_turn("sess_one", 1, "x", "x", "m", 1)
+    assert manager.delete_session_logs("sess_one") is True
+    assert manager.delete_session_logs("sess_one") is False

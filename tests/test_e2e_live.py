@@ -42,8 +42,8 @@ def test_live_3_concurrent_workers_certification():
             assert len(res.text.strip()) > 5, f"Worker {i} returned empty response"
             assert res.conversation_id, f"Worker {i} missing conversation_id"
 
-        # All 5 separate sessions
+        # Each prompt creates a separate session.
         conv_ids = [r.conversation_id for r in results]
-        assert len(set(conv_ids)) == 5, "Workers must run on separate conversations"
+        assert len(set(conv_ids)) == len(TEST_PROMPTS), "Workers must run on separate conversations"
 
     asyncio.run(_run())

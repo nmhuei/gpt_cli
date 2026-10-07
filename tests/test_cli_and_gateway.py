@@ -72,6 +72,37 @@ def test_gateway_anthropic_rejects_non_object_message_entry():
     assert payload["error"]["type"] == "invalid_request_error"
 
 
+def test_gateway_chat_rejects_malformed_tools():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": "invalid",
+        },
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["message"] == "Tools must be an array of objects"
+
+
+def test_gateway_anthropic_rejects_malformed_metadata():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": [],
+        },
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"] == "Metadata must be an object"
+
+
 def test_cli_parser_run_command():
     parser = build_cli_parser()
     args = parser.parse_args(["run", "-p", "Test prompt", "--json", "--resume-session", "sess_custom"])
@@ -125,6 +156,100 @@ def test_agent_continues_from_the_same_dag_until_runtime_budget(monkeypatch, tmp
     assert calls[0][1:] == (None, None)
     assert calls[1][1:] == ("conv_agent", "msg_1")
     assert "Agent runtime target reached" in capsys.readouterr().out
+
+
+def test_agent_resume_session_continuations_stay_on_requested_session_when_other_session_is_active(monkeypatch, tmp_path):
+    import asyncio
+    from gpt_cli.cli.main import handle_agent
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.session.registry import SessionRegistry
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    registry = SessionRegistry()
+    requested = registry.create_session(local_id="sess_a")
+    active = registry.create_session(local_id="sess_b")
+    registry.set_active(active.local_id)
+
+    async def fake_send_turn(self, *args, **kwargs):
+        return TurnResult(
+            "ok",
+            "conv_agent",
+            "msg_agent",
+            "gpt-5-6-thinking",
+            duration_ms=100,
+        )
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args([
+        "agent", "--resume-session", requested.local_id,
+        "--min-runtime-minutes", "0.003", "continue requested work",
+    ])
+
+    asyncio.run(handle_agent(args))
+
+    assert SessionRegistry().require_session(requested.local_id).turns > 0
+    assert SessionRegistry().require_session(active.local_id).turns == 0
+
+
+def test_agent_conversation_pins_attached_session_when_active_changes_during_first_turn(monkeypatch, tmp_path):
+    import asyncio
+    from gpt_cli.cli.main import handle_agent
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.session.registry import SessionRegistry
+    import curl_cffi.requests as curl_requests
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    registry = SessionRegistry()
+    other = registry.create_session(local_id="sess_other")
+    registry.set_active(other.local_id)
+
+    get_calls = 0
+
+    async def fake_get(*args, **kwargs):
+        nonlocal get_calls
+        get_calls += 1
+        class Response:
+            status_code = 200
+            def json(self):
+                return {"current_node": "node_web", "title": "Attached"}
+        return Response()
+
+    class FakeAsyncSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        get = fake_get
+
+    monkeypatch.setattr(curl_requests, "AsyncSession", FakeAsyncSession)
+
+    async def fake_send_turn(self, *args, **kwargs):
+        SessionRegistry().set_active(other.local_id)
+        return TurnResult("ok", "conv_web", "msg_web", "gpt-5-6-thinking", duration_ms=100)
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args([
+        "agent", "--conversation", "web_conv", "--min-runtime-minutes", "0.003", "continue web work",
+    ])
+
+    asyncio.run(handle_agent(args))
+    assert get_calls == 1
+
+    sessions = SessionRegistry()
+    assert sessions.require_session(other.local_id).turns == 0
+    assert args.resume_session != other.local_id
+    assert sessions.require_session(args.resume_session).turns > 0
 
 
 def test_agent_json_emits_one_final_runtime_document(monkeypatch, tmp_path, capsys):
@@ -184,6 +309,7 @@ def test_cli_parser_makes_new_and_resume_contract_unambiguous():
         parser.parse_args(["new", "x"])
     with pytest.raises(SystemExit):
         parser.parse_args(["run", "--resume", "--conversation", "web_uuid", "x"])
+
 
 def test_cli_parser_session_command():
     parser = build_cli_parser()
@@ -277,7 +403,15 @@ def test_cli_json_is_one_document_when_telemetry_arrives(monkeypatch, tmp_path, 
     output = json.loads(rendered)
     assert output["text"] == "healthy"
     assert output["thinking"] == ["Checking health"]
-    assert output["tool_calls"] == [{"id": "tool_1", "tool": "health_check", "payload": "{}", "source": "dag"}]
+    assert output["tool_calls"] == [{
+        "id": "tool_1",
+        "tool": "health_check",
+        "payload": "{}",
+        "source": "dag",
+        "result": "ok",
+        "result_title": None,
+        "finished": True,
+    }]
 
 
 
@@ -916,16 +1050,18 @@ def test_chat_completions_sse_overflow_terminates_with_error(monkeypatch):
 
     monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
 
-    original = server_app._safe_queue_put
+    from gpt_cli.server import openai_routes
+
+    original = openai_routes._safe_queue_put
     calls = {"n": 0}
 
     def overflow_after_first(queue, item):
         calls["n"] += 1
         if calls["n"] > 1:
-            raise server_app.SSEQueueOverflow("forced")
+            raise openai_routes.SSEQueueOverflow("forced")
         original(queue, item)
 
-    monkeypatch.setattr(server_app, "_safe_queue_put", overflow_after_first)
+    monkeypatch.setattr(openai_routes, "_safe_queue_put", overflow_after_first)
 
     res = TestClient(create_app()).post(
         "/v1/chat/completions",
@@ -953,16 +1089,18 @@ def test_anthropic_sse_overflow_terminates_with_error(monkeypatch):
 
     monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
 
-    original = server_app._safe_queue_put
+    from gpt_cli.server import anthropic_routes
+
+    original = anthropic_routes._safe_queue_put
     calls = {"n": 0}
 
     def overflow_after_first(queue, item):
         calls["n"] += 1
         if calls["n"] > 3:
-            raise server_app.SSEQueueOverflow("forced")
+            raise anthropic_routes.SSEQueueOverflow("forced")
         original(queue, item)
 
-    monkeypatch.setattr(server_app, "_safe_queue_put", overflow_after_first)
+    monkeypatch.setattr(anthropic_routes, "_safe_queue_put", overflow_after_first)
 
     res = TestClient(create_app()).post(
         "/v1/messages",
@@ -1082,3 +1220,788 @@ def test_sse_sentinel_cancellation_propagates():
             await cancelled()
 
     asyncio.run(run())
+
+def test_gateway_anthropic_rejects_explicit_null_tools():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={"model": "gpt-5-6-thinking", "messages": [{"role": "user", "content": "hello"}], "tools": None},
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"] == "Tools must be an array of objects"
+
+
+def test_gateway_anthropic_allows_null_metadata():
+    from gpt_cli.server.gateway import _validate_gateway_messages
+
+    _, error = _validate_gateway_messages(
+        {"messages": [{"role": "user", "content": "hello"}], "metadata": None},
+        anthropic=True,
+    )
+    assert error is None
+
+
+def test_gateway_chat_rejects_object_model():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={"model": {}, "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["message"] == "Model must be a string"
+
+
+def test_gateway_anthropic_rejects_object_model():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={"model": {}, "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"] == "Model must be a string"
+
+
+def test_gateway_chat_rejects_string_stream():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={"stream": "false", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["message"] == "Stream must be a boolean"
+
+
+def test_gateway_anthropic_rejects_string_stream():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={"stream": "false", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"] == "Stream must be a boolean"
+
+
+def test_agent_fresh_session_stays_pinned_if_active_session_changes_during_first_turn(monkeypatch, tmp_path):
+    """The continuation target is the agent session, not a later active session."""
+    import asyncio
+    from gpt_cli.cli.main import handle_agent
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.session.registry import SessionRegistry
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    registry = SessionRegistry()
+    calls = []
+
+    async def fake_send_turn(self, prompt, conversation_id=None, parent_id=None, **kwargs):
+        calls.append((prompt, conversation_id, parent_id))
+        if len(calls) == 1:
+            other = registry.create_session(local_id="sess_other")
+            registry.set_active(other.local_id)
+        return TurnResult("ok", "conv_agent", f"msg_{len(calls)}", "gpt-5-6-thinking", duration_ms=100)
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args([
+        "agent", "--min-runtime-minutes", "0.003", "fresh work",
+    ])
+
+    asyncio.run(handle_agent(args))
+
+    assert len(calls) == 2
+    assert SessionRegistry().require_session("sess_other").turns == 0
+    assert SessionRegistry().require_session(args.resume_session).turns == 2
+
+
+def test_agent_resume_implicit_session_stays_pinned_if_active_session_changes_during_first_turn(monkeypatch, tmp_path):
+    import asyncio
+    from gpt_cli.cli.main import handle_agent
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.session.registry import SessionRegistry
+
+    monkeypatch.setattr("gpt_cli.cli.main.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr("gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("gpt_cli.session.logger.defaults.DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr("gpt_cli.cli.main.defaults.user_runtime_dir", lambda: tmp_path / "runtime")
+
+    registry = SessionRegistry()
+    requested = registry.create_session(local_id="sess_requested")
+    registry.set_active(requested.local_id)
+    calls = []
+
+    async def fake_send_turn(self, prompt, conversation_id=None, parent_id=None, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1:
+            other = registry.create_session(local_id="sess_other")
+            registry.set_active(other.local_id)
+        return TurnResult("ok", "conv_agent", f"msg_{len(calls)}", "gpt-5-6-thinking", duration_ms=100)
+
+    monkeypatch.setattr("gpt_cli.cli.main.WireTransport.send_turn", fake_send_turn)
+    args = build_cli_parser().parse_args([
+        "agent", "--resume", "--min-runtime-minutes", "0.003", "resume work",
+    ])
+
+    asyncio.run(handle_agent(args))
+
+    assert len(calls) == 2
+    assert SessionRegistry().require_session("sess_requested").turns == 2
+    assert SessionRegistry().require_session("sess_other").turns == 0
+
+
+def test_chat_completions_streaming_session_title():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5-6-thinking",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "Generate the session title for an AI coding-assistant based on: hello world"}
+            ]
+        }
+    )
+    assert res.status_code == 200
+    assert "text/event-stream" in res.headers.get("content-type", "")
+    assert "chat.completion.chunk" in res.text
+    assert "data: [DONE]" in res.text
+
+
+def test_format_chat_messages_supports_nested_openai_function_tools():
+    from gpt_cli.server.prompt_formatter import format_chat_messages
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up weather in a location",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }
+    ]
+    prompt = format_chat_messages([{"role": "user", "content": "weather in Tokyo"}], tools=tools)
+    assert "lookup_weather" in prompt
+    assert "Look up weather in a location" in prompt
+    assert "Tokyo" in prompt
+
+
+def test_gateway_rejects_non_string_tool_names():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5-6-thinking",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": 123}]
+        }
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert "Each tool must have a non-empty string name" in payload["error"]["message"]
+
+
+def test_chat_completions_streaming_worker_error_emits_error_payload(monkeypatch):
+    from gpt_cli.core.types import TokenBundle
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+
+    async def fake_send_turn(self, prompt, *args, **kwargs):
+        raise RuntimeError("upstream exploded")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5-6-thinking",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}]
+        }
+    )
+    assert res.status_code == 200
+    assert "upstream exploded" in res.text
+    assert "data: [DONE]" not in res.text
+
+
+def test_anthropic_streaming_worker_error_emits_error_event(monkeypatch):
+    from gpt_cli.core.types import TokenBundle
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+
+    async def fake_send_turn(self, prompt, *args, **kwargs):
+        raise RuntimeError("anthropic wire failed")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5-6-thinking",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}]
+        }
+    )
+    assert res.status_code == 200
+    assert "event: error" in res.text
+    assert "anthropic wire failed" in res.text
+    assert "api_error" in res.text
+
+
+def test_session_title_avoid_false_positive_on_generic_system_prompt():
+    from gpt_cli.server.session_title import _is_session_title_request
+    msgs = [{"role": "user", "content": "Help me write documentation"}]
+    sys = "You are a helpful assistant. Always provide a concise title above your answers."
+    assert _is_session_title_request(msgs, sys) is False
+
+def test_resolve_tool_name_handles_non_string_names_gracefully():
+    from gpt_cli.server.tool_utils import _resolve_tool_name
+    # Non-string tool names in registered set should not crash with AttributeError
+    resolved, unwrap = _resolve_tool_name("bash", {123, "bash", None})
+    assert resolved == "bash"
+    assert unwrap is False
+
+
+def test_anthropic_streaming_queue_overflow_event_shape(monkeypatch):
+    import json
+    from gpt_cli.core.types import TokenBundle
+    from gpt_cli.server.gateway import SSEQueueOverflow
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token")
+    )
+
+    async def fake_send_turn(self, prompt, *args, **kwargs):
+        raise SSEQueueOverflow("queue is full")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5-6-thinking",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test overflow"}]
+        }
+    )
+    assert res.status_code == 200
+    lines = [l.strip() for l in res.iter_lines() if l.strip()]
+    error_line = next((lines[i+1] for i, l in enumerate(lines) if l == "event: error"), None)
+    assert error_line is not None
+    data = json.loads(error_line[6:])
+    assert data["type"] == "error"
+    assert data["error"]["type"] == "overloaded_error"
+    assert "SSE queue overflow" in data["error"]["message"]
+
+
+def test_finish_sse_worker_does_not_deadlock_when_queue_is_full():
+    import asyncio
+
+    from gpt_cli.server.app import _finish_sse_worker
+
+    async def scenario():
+        queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait("frame")
+        task = asyncio.create_task(_finish_sse_worker(queue))
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert queue.get_nowait() == "frame"
+        await asyncio.wait_for(task, timeout=1)
+        assert queue.get_nowait() is None
+
+    asyncio.run(scenario())
+
+def test_gateway_openai_rejects_non_string_nested_text_block():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": 123}],
+            }]
+        },
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["message"] == "Text content must be a string"
+
+
+def test_gateway_anthropic_rejects_non_string_nested_text_block():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": 123}],
+            }]
+        },
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"] == "Text content must be a string"
+
+
+def test_anthropic_sse_overflow_persists_captured_dag_ids(monkeypatch, tmp_path):
+    from gpt_cli.core.types import TokenBundle
+    from gpt_cli.server import app as server_app
+    from gpt_cli.telemetry.events import TelemetryEvent
+
+    updates = []
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token"),
+    )
+    monkeypatch.setattr(
+        "gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR",
+        str(tmp_path),
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        on_event(TelemetryEvent(event_type="conversation_id", data={"conversation_id": "conv_overflow"}))
+        on_event(TelemetryEvent(event_type="message_id", data={"message_id": "msg_overflow"}))
+        on_event(TelemetryEvent(event_type="thinking", data={"thoughts": [{"summary": "frame"}]}))
+        raise server_app.SSEQueueOverflow("forced")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+
+    original_checkpoint = server_app.SessionRegistry.checkpoint
+
+    def capture_checkpoint(self, *args, **kwargs):
+        updates.append(kwargs)
+        return original_checkpoint(self, *args, **kwargs)
+
+    monkeypatch.setattr(server_app.SessionRegistry, "checkpoint", capture_checkpoint)
+
+    res = TestClient(create_app()).post(
+        "/v1/messages",
+        headers={"x-deepseek-harness-session-id": "sess_overflow"},
+        json={
+            "model": "gpt-5-6-thinking",
+            "stream": True,
+            "messages": [{"role": "user", "content": "test"}],
+        },
+    )
+
+    assert res.status_code == 200
+    assert "SSE queue overflow" in res.text
+    assert any(
+        update.get("conversation_id") == "conv_overflow"
+        and update.get("message_id") == "msg_overflow"
+        for update in updates
+    )
+
+    from gpt_cli.session.registry import SessionRegistry
+    record = SessionRegistry().get_session("sess_overflow")
+    assert record is not None
+    assert record.conversation_id == "conv_overflow"
+    assert record.last_message_id == "msg_overflow"
+    assert record.turns == 0
+
+
+def test_gateway_tool_result_nested_text_null_rejected():
+    client = TestClient(create_app())
+    res = client.post(
+        "/v1/messages",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{"type": "text", "text": None}],
+                }],
+            }]
+        },
+    )
+    assert res.status_code == 400
+    payload = res.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"] == "Text content must be a string"
+
+
+
+def test_anthropic_incomplete_turn_result_checkpoints_without_counting_turn(monkeypatch, tmp_path):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.server import app as server_app
+
+    calls = {"update": [], "checkpoint": []}
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token"),
+    )
+    monkeypatch.setattr(
+        "gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR",
+        str(tmp_path),
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        return TurnResult(
+            text="partial",
+            conversation_id="conv_partial",
+            message_id="msg_partial",
+            model="test",
+            status="failed",
+            error="incomplete",
+        )
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+    monkeypatch.setattr(server_app.SessionRegistry, "update_turn", lambda self, *a, **kw: calls["update"].append(kw))
+    monkeypatch.setattr(server_app.SessionRegistry, "checkpoint", lambda self, *a, **kw: calls["checkpoint"].append(kw))
+
+    res = TestClient(create_app()).post(
+        "/v1/messages",
+        headers={"x-deepseek-harness-session-id": "sess_partial"},
+        json={"model": "gpt-5-6-thinking", "messages": [{"role": "user", "content": "test"}]},
+    )
+
+    assert res.status_code == 500
+    assert calls["update"] == []
+    assert calls["checkpoint"]
+    assert calls["checkpoint"][0]["conversation_id"] == "conv_partial"
+    assert calls["checkpoint"][0]["message_id"] == "msg_partial"
+
+def test_anthropic_terminal_turn_result_updates_turn(monkeypatch, tmp_path):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.server import app as server_app
+
+    calls = {"update": [], "checkpoint": []}
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token"),
+    )
+    monkeypatch.setattr(
+        "gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR",
+        str(tmp_path),
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        return TurnResult(
+            text="done",
+            conversation_id="conv_terminal",
+            message_id="msg_terminal",
+            model="test",
+            status="terminal",
+            lifecycle_status="model_terminal",
+        )
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+    monkeypatch.setattr(server_app.SessionRegistry, "update_turn", lambda self, *a, **kw: calls["update"].append(kw))
+    monkeypatch.setattr(server_app.SessionRegistry, "checkpoint", lambda self, *a, **kw: calls["checkpoint"].append(kw))
+
+    res = TestClient(create_app()).post(
+        "/v1/messages",
+        headers={"x-deepseek-harness-session-id": "sess_terminal"},
+        json={"model": "gpt-5-6-thinking", "messages": [{"role": "user", "content": "test"}]},
+    )
+
+    assert res.status_code == 200
+    assert calls["checkpoint"] == []
+    assert calls["update"][0]["conversation_id"] == "conv_terminal"
+    assert calls["update"][0]["last_message_id"] == "msg_terminal"
+
+
+def test_anthropic_stream_incomplete_turn_result_checkpoints_and_emits_error(monkeypatch, tmp_path):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    from gpt_cli.server import app as server_app
+
+    calls = {"update": [], "checkpoint": []}
+
+    monkeypatch.setattr(
+        "gpt_cli.server.app.TokenCacheManager.load_disk_cache",
+        lambda self: TokenBundle(access_token="fake_token"),
+    )
+    monkeypatch.setattr(
+        "gpt_cli.session.registry.defaults.DEFAULT_SESSION_DIR",
+        str(tmp_path),
+    )
+
+    async def fake_send_turn(self, prompt, *args, on_event=None, **kwargs):
+        return TurnResult(
+            text="partial",
+            conversation_id="conv_stream_partial",
+            message_id="msg_stream_partial",
+            model="test",
+            status="failed",
+            lifecycle_status="transport_lost",
+            error="incomplete",
+        )
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+    monkeypatch.setattr(server_app.SessionRegistry, "update_turn", lambda self, *a, **kw: calls["update"].append(kw))
+    monkeypatch.setattr(server_app.SessionRegistry, "checkpoint", lambda self, *a, **kw: calls["checkpoint"].append(kw))
+
+    res = TestClient(create_app()).post(
+        "/v1/messages",
+        headers={"x-deepseek-harness-session-id": "sess_stream_partial"},
+        json={"model": "gpt-5-6-thinking", "stream": True, "messages": [{"role": "user", "content": "test"}]},
+    )
+
+    assert res.status_code == 200
+    assert "incomplete" in res.text
+    assert calls["update"] == []
+    assert calls["checkpoint"]
+    assert calls["checkpoint"][0]["conversation_id"] == "conv_stream_partial"
+    assert calls["checkpoint"][0]["message_id"] == "msg_stream_partial"
+
+
+def test_gateway_chat_rejects_numeric_message_content():
+    from gpt_cli.server.gateway import _validate_gateway_messages
+
+    body, error = _validate_gateway_messages(
+        {"messages": [{"role": "user", "content": 123}]}
+    )
+    assert body is None
+    assert error is not None
+    assert error.status_code == 400
+
+
+def test_gateway_anthropic_rejects_numeric_message_content():
+    from gpt_cli.server.gateway import _validate_gateway_messages
+
+    body, error = _validate_gateway_messages(
+        {"messages": [{"role": "user", "content": 123}]}, anthropic=True
+    )
+    assert body is None
+    assert error is not None
+    assert error.status_code == 400
+
+
+def test_gateway_chat_rejects_null_user_content():
+    from gpt_cli.server.gateway import _validate_gateway_messages
+
+    body, error = _validate_gateway_messages(
+        {"messages": [{"role": "user", "content": None}]}
+    )
+    assert body is None
+    assert error is not None
+    assert error.status_code == 400
+
+
+def test_gateway_anthropic_rejects_null_message_content():
+    from gpt_cli.server.gateway import _validate_gateway_messages
+
+    body, error = _validate_gateway_messages(
+        {"messages": [{"role": "user", "content": None}]}, anthropic=True
+    )
+    assert body is None
+    assert error is not None
+    assert error.status_code == 400
+
+
+def test_gateway_allows_openai_assistant_null_content_with_tool_calls():
+    from gpt_cli.server.gateway import _validate_gateway_messages
+
+    body, error = _validate_gateway_messages(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+                }
+            ]
+        }
+    )
+    assert error is None
+    assert body is not None
+
+
+def test_format_chat_messages_preserves_null_content_openai_tool_history():
+    from gpt_cli.server.prompt_formatter import format_chat_messages
+
+    prompt = format_chat_messages([
+        {"role": "user", "content": "What is the weather in Hanoi?"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_weather_123", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"Hanoi"}'}}]},
+        {"role": "tool", "tool_call_id": "call_weather_123", "content": "30C"},
+    ])
+
+    assert "call_weather_123" in prompt
+    assert "get_weather" in prompt
+    assert "Hanoi" in prompt
+    assert "[Tool Result call_id=call_weather_123]" in prompt
+    assert prompt.count("[Tool Result call_id=call_weather_123]") == 1
+
+
+def test_format_chat_messages_preserves_empty_tool_result_association_and_parallel_calls():
+    from gpt_cli.server.prompt_formatter import format_chat_messages
+
+    prompt = format_chat_messages([
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": "checking",
+            "tool_calls": [
+                {
+                    "id": "call_hanoi",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Hanoi"}',
+                    },
+                },
+                {
+                    "id": "call_tokyo",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Tokyo"}',
+                    },
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_hanoi", "content": ""},
+        {"role": "tool", "tool_call_id": "call_tokyo", "content": "20C"},
+    ])
+
+    assert "checking" in prompt
+    assert "call_hanoi" in prompt
+    assert "call_tokyo" in prompt
+    assert '{"city":"Hanoi"}' in prompt
+    assert '{"city":"Tokyo"}' in prompt
+    assert prompt.count("[Tool Result call_id=call_hanoi]") == 1
+    assert prompt.count("[Tool Result call_id=call_tokyo]") == 1
+
+
+def test_format_chat_messages_preserves_legacy_function_result_name():
+    from gpt_cli.server.prompt_formatter import format_chat_messages
+
+    prompt = format_chat_messages([
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "function_call": {
+                "name": "get_weather",
+                "arguments": '{"city":"Hanoi"}',
+            },
+        },
+        {
+            "role": "function",
+            "name": "get_weather",
+            "content": "30C",
+        },
+    ])
+
+    assert "[Function Result name=get_weather]" in prompt
+    assert prompt.count("[Function Result name=get_weather]") == 1
+
+
+def test_chat_completion_preserves_null_content_tool_calls(monkeypatch):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+
+    seen = {}
+    monkeypatch.setattr("gpt_cli.server.app.TokenCacheManager.load_disk_cache", lambda self: TokenBundle(access_token="fake_token"))
+
+    async def fake_send_turn(self, prompt, *args, **kwargs):
+        seen["prompt"] = prompt
+        return TurnResult(text="Weather returned", model="gpt-5-6-thinking", conversation_id="conv", message_id="msg")
+
+    monkeypatch.setattr("gpt_cli.server.app.WireTransport.send_turn", fake_send_turn)
+    res = TestClient(create_app()).post("/v1/chat/completions", json={
+        "model": "gpt-5-6-thinking",
+        "messages": [
+            {"role": "user", "content": "weather"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_weather_123", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"Hanoi"}'}}]},
+            {"role": "tool", "tool_call_id": "call_weather_123", "content": "30C"},
+        ],
+    })
+
+    assert res.status_code == 200
+    assert "call_weather_123" in seen["prompt"]
+    assert "get_weather" in seen["prompt"]
+    assert '{"city":"Hanoi"}' in seen["prompt"]
+    assert "30C" in seen["prompt"]
+    assert "[Tool Result call_id=call_weather_123]" in seen["prompt"]
+    assert seen["prompt"].count("[Tool Result call_id=call_weather_123]") == 1
+
+
+def test_openai_gateway_uses_settings_defaults_and_request_override(monkeypatch):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    import gpt_cli.server.app as server_app
+    import gpt_cli.server.openai_routes as openai_routes
+
+    calls = []
+
+    class FakeSettings:
+        default_model = "settings-openai-model"
+        default_effort = "settings-effort"
+        default_bridge_name = None
+        max_workers = 1
+
+    async def fake_send_turn(self, *args, **kwargs):
+        calls.append(kwargs)
+        return TurnResult("ok", "conv", "msg", kwargs["model_alias"], duration_ms=1)
+
+    monkeypatch.setattr(openai_routes, "Settings", FakeSettings)
+    monkeypatch.setattr(server_app.TokenCacheManager, "load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr(server_app.WireTransport, "send_turn", fake_send_turn)
+
+    client = TestClient(create_app())
+    assert client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+    assert calls[-1]["model_alias"] == "settings-openai-model"
+    assert calls[-1]["effort"] == "settings-effort"
+
+    assert client.post("/v1/chat/completions", json={"model": "override", "effort": "low", "messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+    assert calls[-1]["model_alias"] == "override"
+    assert calls[-1]["effort"] == "low"
+
+
+def test_anthropic_gateway_uses_settings_defaults(monkeypatch):
+    from gpt_cli.core.types import TokenBundle, TurnResult
+    import gpt_cli.server.app as server_app
+    import gpt_cli.server.anthropic_routes as anthropic_routes
+
+    calls = []
+
+    class FakeSettings:
+        default_model = "settings-anthropic-model"
+        default_effort = "settings-anthropic-effort"
+        default_bridge_name = None
+        max_workers = 1
+
+    async def fake_send_turn(self, *args, **kwargs):
+        calls.append(kwargs)
+        return TurnResult("ok", "conv", "msg", kwargs["model_alias"], duration_ms=1)
+
+    monkeypatch.setattr(anthropic_routes, "Settings", FakeSettings)
+    monkeypatch.setattr(server_app.TokenCacheManager, "load_disk_cache", lambda self: TokenBundle(access_token="fake"))
+    monkeypatch.setattr(server_app.WireTransport, "send_turn", fake_send_turn)
+
+    client = TestClient(create_app())
+    assert client.post("/v1/messages", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+    assert calls[-1]["model_alias"] == "settings-anthropic-model"
+    assert calls[-1]["effort"] == "settings-anthropic-effort"
+
+def test_stream_routes_resolve_shared_sse_finalizer():
+    import gpt_cli.server.anthropic_routes as anthropic_routes
+    import gpt_cli.server.openai_routes as openai_routes
+    from gpt_cli.server.sse_utils import _finish_sse_worker
+
+    assert anthropic_routes._finish_sse_worker is _finish_sse_worker
+    assert openai_routes._finish_sse_worker is _finish_sse_worker

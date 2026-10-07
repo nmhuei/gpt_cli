@@ -51,25 +51,24 @@ def resolve_prompt_with_bridge(
     if legacy_match:
         target_bridge = legacy_match.group(1).strip()
         clean_prompt = legacy_match.group(2).strip()
-        return f"@{target_bridge}" + (f" {clean_prompt}" if clean_prompt else "")
-
-    # Check for explicit leading @[name] or @name
-    # Matches: @[name], @[name]:, @name, @name:
-    explicit_match = re.match(r"^@\[([a-zA-Z0-9_\-]+)\](?:\s*:\s*|\s+)?(.*)$", p, re.DOTALL)
-    if not explicit_match:
-        explicit_match = re.match(r"^@([a-zA-Z0-9_\-]+)(?:\s*:\s*|\s+|$)(.*)$", p, re.DOTALL)
-
-    if explicit_match:
-        target_bridge = explicit_match.group(1).strip()
-        clean_prompt = explicit_match.group(2).strip()
     else:
-        # No explicit @mention in prompt: check default / active bridge
-        if not bridge_name or str(bridge_name).lower() in ("off", "none", "false"):
-            return p
-        target_bridge = str(bridge_name).lstrip("@").strip()
-        if not target_bridge or target_bridge.lower() in ("off", "none", "false"):
-            return p
-        clean_prompt = p
+        # Check for explicit leading @[name] or @name
+        # Matches: @[name], @[name]:, @name, @name:
+        explicit_match = re.match(r"^@\[([a-zA-Z0-9_\-]+)\](?:\s*:\s*|\s+)?(.*)$", p, re.DOTALL)
+        if not explicit_match:
+            explicit_match = re.match(r"^@([a-zA-Z0-9_\-]+)(?:\s*:\s*|\s+|$)(.*)$", p, re.DOTALL)
+
+        if explicit_match:
+            target_bridge = explicit_match.group(1).strip()
+            clean_prompt = explicit_match.group(2).strip()
+        else:
+            # No explicit @mention in prompt: check default / active bridge
+            if not bridge_name or str(bridge_name).lower() in ("off", "none", "false"):
+                return p
+            target_bridge = str(bridge_name).lstrip("@").strip()
+            if not target_bridge or target_bridge.lower() in ("off", "none", "false"):
+                return p
+            clean_prompt = p
 
     prefix = f"[${target_bridge}](app://{connector_id})" if connector_id else f"@{target_bridge}"
     return prefix + (f" {clean_prompt}" if clean_prompt else "")

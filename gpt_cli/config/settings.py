@@ -7,6 +7,8 @@ def load_dotenv_search() -> Path | None:
     """Finds and loads .env from candidate paths."""
     candidates = [
         Path(__file__).resolve().parent.parent.parent / ".env",
+        defaults.user_data_dir() / ".env",
+        defaults.user_config_dir() / ".env",
         Path.home() / ".local/share/webgpt/.env",
         Path.home() / ".config/webgpt/.env",
     ]
@@ -57,7 +59,7 @@ class Settings:
     # independent of the public MCP tunnel and only used for bound sessions.
     bqa_activity_url: str = field(
         default_factory=lambda: os.getenv(
-            "BQA_ACTIVITY_URL", "http://127.0.0.1:18427/api/v1/activity/stream"
+            "BQA_ACTIVITY_URL", defaults.DEFAULT_BQA_ACTIVITY_URL
         ).rstrip("/")
     )
 

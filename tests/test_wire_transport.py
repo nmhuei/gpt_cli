@@ -4,6 +4,7 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from gpt_cli.core.types import SteerContext, TokenBundle, TurnResult
+from gpt_cli.core.token_cache import TokenCacheManager
 from gpt_cli.models.registry import ModelRegistry
 from gpt_cli.transport.wire import WireTransport
 from gpt_cli.transport.admission import UpstreamAdmission
@@ -489,7 +490,7 @@ def test_wire_backfills_only_missing_dag_timeline_events_after_sse_error():
         with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as prepare:
             prepare.return_value = ({}, "s1", "t1", None)
             transport.session.post = AsyncMock(return_value=MockResponse())
-            with patch("gpt_cli.transport.conversation.ConversationRecovery.fetch", new_callable=AsyncMock, return_value=recovered):
+            with patch("gpt_cli.transport.conversation.ConversationRecovery.fetch_settled", new_callable=AsyncMock, return_value=recovered):
                 result = await transport._send_once("hello", on_event=events.append)
 
         assert result.lifecycle_status == "completed_turn"
@@ -567,7 +568,8 @@ def test_wire_send_turn_triggers_lifebuoy_on_401(tmp_path):
         expired_payload = base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) - 3600}).encode()).decode().rstrip("=")
         expired_token = f"eyJhbGciOiJIUzI1NiJ9.{expired_payload}.signature"
         bundle = TokenBundle(access_token=expired_token, oai_device_id="dev")
-        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0))
+        cache_mgr = TokenCacheManager(tmp_path / "cache")
+        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0), cache_manager=cache_mgr)
 
         mock_send = AsyncMock()
         mock_send.side_effect = [
@@ -588,10 +590,10 @@ def test_wire_send_turn_triggers_lifebuoy_on_401(tmp_path):
 
     asyncio.run(_run())
 
-def test_wire_empty_text_marks_failed_and_preserves_parent_id():
+def test_wire_empty_text_marks_failed_and_preserves_parent_id(tmp_path):
     async def _run():
         bundle = TokenBundle(access_token="fake", oai_device_id="dev")
-        transport = WireTransport(bundle)
+        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0))
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -650,3 +652,258 @@ def test_wire_waits_for_every_correlated_tool_after_done_marker():
         assert result.text == "answer"
 
     asyncio.run(_run())
+
+
+def test_wire_recovers_finished_successfully_dag_answer_without_finish_type():
+    """A backend terminal success may omit finish_details; recovery must still complete."""
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        transport = WireTransport(bundle)
+
+        class MockResponse:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_recovered","error":"stream lost"}\n\n'
+
+        recovered = SimpleNamespace(
+            role="assistant",
+            recipient="all",
+            content_type="text",
+            message_status="finished_successfully",
+            finish_type=None,
+            node_id="assistant_final",
+            text="Recovered without finish details",
+            matches_expected_message=True,
+        )
+
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as mock_prep:
+            mock_prep.return_value = ({}, "s1", "t1", None)
+            with patch.object(transport.session, "post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = MockResponse()
+                with patch(
+                    "gpt_cli.transport.conversation.ConversationRecovery.fetch",
+                    new_callable=AsyncMock,
+                    return_value=recovered,
+                ):
+                    result = await transport._send_once(prompt="hello")
+
+        assert result.status == "completed"
+        assert result.lifecycle_status == "completed_turn"
+        assert result.text == "Recovered without finish details"
+        assert result.error is None
+
+    asyncio.run(_run())
+
+
+def test_wire_transport_send_turn_aborts_immediately_on_sse_queue_overflow(tmp_path):
+    from gpt_cli.server.gateway import SSEQueueOverflow
+
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        transport = WireTransport(bundle, admission=UpstreamAdmission(tmp_path, request_interval_seconds=0.0))
+        attempts = 0
+
+        async def fake_send_once(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise SSEQueueOverflow("queue full")
+
+        transport._send_once = fake_send_once
+        transport.session = MagicMock()
+        transport.session.close = AsyncMock()
+
+        with pytest.raises(SSEQueueOverflow):
+            await transport.send_turn(prompt="test", model_alias="gpt-5-6-thinking")
+
+        assert attempts == 1
+
+    asyncio.run(_run())
+
+
+def test_conversation_recovery_settled_raises_on_protocol_errors():
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+
+        for status_code in (401, 403, 404):
+            session = MagicMock()
+            response = MagicMock(status_code=status_code)
+            session.get = AsyncMock(return_value=response)
+            recovery = ConversationRecovery(bundle, session=session)
+
+            with pytest.raises(RuntimeError, match=f"HTTP {status_code}"):
+                await recovery.fetch_settled("conv_123", max_attempts=5, interval_seconds=0.01)
+
+            assert session.get.call_count == 1, f"Expected 1 call (fail-fast on HTTP {status_code}), got {session.get.call_count}"
+
+    asyncio.run(_run())
+
+
+def test_conversation_recovery_settled_retries_transient_failures_and_recovers():
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+        session = MagicMock()
+
+        resp_502 = MagicMock(status_code=502)
+        resp_200 = MagicMock(status_code=200)
+        resp_200.json.return_value = {
+            "current_node": "node_final",
+            "mapping": {
+                "node_final": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text"},
+                        "status": "finished_successfully",
+                        "metadata": {"finish_details": {"type": "stop"}},
+                    }
+                }
+            },
+        }
+
+        # Attempt 1: 502 Bad Gateway (transient HTTP)
+        # Attempt 2: ConnectionError (transient network exception)
+        # Attempt 3: 200 OK settled state
+        session.get = AsyncMock(side_effect=[
+            resp_502,
+            ConnectionError("network reset"),
+            resp_200,
+        ])
+        recovery = ConversationRecovery(bundle, session=session)
+
+        state = await recovery.fetch_settled("conv_123", max_attempts=5, interval_seconds=0.01)
+
+        assert state.node_id == "node_final"
+        assert state.message_status == "finished_successfully"
+        assert session.get.call_count == 3
+
+    asyncio.run(_run())
+
+
+def test_conversation_recovery_image_artifact_raises_on_auth_and_retries_transient():
+    async def _run():
+        bundle = TokenBundle(access_token="fake", oai_device_id="dev")
+
+        # 1. Fail fast on 401
+        session_401 = MagicMock()
+        session_401.get = AsyncMock(return_value=MagicMock(status_code=401))
+        recovery_401 = ConversationRecovery(bundle, session=session_401)
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            await recovery_401.fetch_until_image_artifact("conv_123", max_attempts=5, interval_seconds=0.01)
+        assert session_401.get.call_count == 1
+
+        # 2. Retries transient failure and recovers image artifact
+        session_transient = MagicMock()
+        resp_503 = MagicMock(status_code=503)
+        resp_200 = MagicMock(status_code=200)
+        resp_200.json.return_value = {
+            "current_node": "img_node",
+            "mapping": {
+                "server_user": {"parent": "client-created-root", "message": {"author": {"role": "user"}}},
+                "img_node": {
+                    "parent": "server_user",
+                    "message": {
+                        "id": "img_node",
+                        "author": {"role": "tool", "name": "image_tool"},
+                        "content": {
+                            "content_type": "multimodal_text",
+                            "parts": [{
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_async123",
+                                "mime_type": "image/png",
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+        session_transient.get = AsyncMock(side_effect=[resp_503, resp_200])
+        recovery_transient = ConversationRecovery(bundle, session=session_transient)
+        state = await recovery_transient.fetch_until_image_artifact("conv_123", max_attempts=5, interval_seconds=0.01)
+        assert state.node_id == "img_node"
+        assert session_transient.get.call_count == 2
+        assert any(event.event_type == "image_artifact" for event in state.timeline)
+
+    asyncio.run(_run())
+
+
+def test_wire_sse_disconnect_recovers_successfully_from_dag_state():
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+        events = []
+
+        class MockResponse:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_1"}\n\n'
+                yield b'data: {"error":"stream interrupted"}\n\n'
+
+        recovered = SimpleNamespace(
+            role="assistant",
+            recipient="all",
+            content_type="text",
+            message_status="finished_successfully",
+            finish_type="stop",
+            node_id="assistant_final",
+            text="Recovered after disconnect",
+            matches_expected_message=True,
+            timeline=(),
+        )
+
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as prepare:
+            prepare.return_value = ({}, "s1", "t1", None)
+            transport.session.post = AsyncMock(return_value=MockResponse())
+            with patch("gpt_cli.transport.conversation.ConversationRecovery.fetch_settled", new_callable=AsyncMock, return_value=recovered):
+                result = await transport._send_once("hello", on_event=events.append)
+
+        assert result.text == "Recovered after disconnect"
+        assert result.lifecycle_status == "completed_turn"
+
+    asyncio.run(_run())
+
+
+def test_wire_sse_disconnect_recovery_failure_surfaces_error():
+    async def _run():
+        transport = WireTransport(TokenBundle(access_token="fake", oai_device_id="dev"))
+
+        class MockResponse:
+            status_code = 200
+
+            async def aiter_content(self):
+                yield b'data: {"conversation_id":"conv_1"}\n\n'
+                yield b'data: {"error":"stream interrupted"}\n\n'
+
+        failed = SimpleNamespace(
+            role="assistant",
+            recipient="all",
+            content_type="text",
+            message_status="in_progress",
+            finish_type=None,
+            node_id="assistant_pending",
+            text="",
+            matches_expected_message=False,
+            timeline=(),
+        )
+
+        with patch.object(ConduitHandshake, "prepare_turn", new_callable=AsyncMock) as prepare:
+            prepare.return_value = ({}, "s1", "t1", None)
+            transport.session.post = AsyncMock(return_value=MockResponse())
+            with patch("gpt_cli.transport.conversation.ConversationRecovery.fetch_settled", new_callable=AsyncMock, return_value=failed):
+                result = await transport._send_once("hello")
+
+        assert result.lifecycle_status != "completed_turn"
+        assert result.error
+
+    asyncio.run(_run())
+
+
+def test_shared_payload_builder_preserves_effort_normalization():
+    from gpt_cli.transport.payloads import build_payload, normalize_effort
+    from gpt_cli.models.registry import ModelRegistry
+
+    model = ModelRegistry.resolve("gpt-5-6-thinking")
+    assert normalize_effort("low", model) == "standard"
+    payload = build_payload("hello", model_alias="gpt-5-6-thinking", effort="low")
+    assert payload["thinking_effort"] == "standard"
+    assert payload["messages"][0]["metadata"]["thinking_effort"] == "standard"

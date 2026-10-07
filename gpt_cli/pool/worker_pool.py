@@ -6,7 +6,11 @@ class WorkerPool:
     """Smart async worker pool enforcing strict concurrency bounding (default=3)."""
 
     def __init__(self, max_workers: int | None = None):
-        self.max_workers = max_workers or defaults.DEFAULT_MAX_WORKERS
+        if max_workers is None:
+            max_workers = defaults.DEFAULT_MAX_WORKERS
+        if max_workers <= 0:
+            raise ValueError("max_workers must be a positive integer")
+        self.max_workers = max_workers
         self.semaphore = asyncio.Semaphore(self.max_workers)
         self._active_count = 0
         self._lock = asyncio.Lock()

@@ -11,6 +11,7 @@ from ..config.settings import Settings
 from ..models.registry import ModelRegistry
 from .conduit import ConduitHandshake
 from .admission import UpstreamAdmission, UpstreamCooldownError, is_upstream_rejection
+from .payloads import build_payload, normalize_effort
 
 class WireTransport:
     """High-performance Wire Conduit transport (0 MB browser RAM) via curl_cffi."""
@@ -20,11 +21,17 @@ class WireTransport:
         bundle: TokenBundle,
         user_agent: str | None = None,
         admission: UpstreamAdmission | None = None,
+        cache_manager: Any | None = None,
     ):
         self.bundle = bundle
         self.user_agent = user_agent or defaults.DEFAULT_USER_AGENT
         self.session = AsyncSession(impersonate="chrome146")
         self.admission = admission or UpstreamAdmission()
+        if cache_manager is not None:
+            self.cache_manager = cache_manager
+        else:
+            from ..core.token_cache import TokenCacheManager
+            self.cache_manager = TokenCacheManager()
         self.latest_turn_headers: dict[str, str] = {}
         self.latest_turn_trace_id: str | None = None
 
@@ -38,40 +45,7 @@ class WireTransport:
         system_hints: list[str] | None = None,
         selected_mcp_sources: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        model_def = ModelRegistry.resolve(model_alias)
-        chosen_effort = effort or model_def.default_effort
-        if chosen_effort not in ("extended", "standard"):
-            chosen_effort = "standard" if chosen_effort in ("low", "none", "off", "min", "medium") else "extended"
-
-        msg_id = str(uuid.uuid4())
-        message: dict[str, Any] = {
-            "id": msg_id,
-            "author": {"role": "user"},
-            "content": {"content_type": "text", "parts": [prompt]},
-        }
-        metadata: dict[str, Any] = {}
-        if selected_mcp_sources:
-            metadata["selected_mcp_sources"] = list(selected_mcp_sources)
-        if model_def.supports_thinking:
-            metadata["thinking_effort"] = chosen_effort
-        if metadata:
-            message["metadata"] = metadata
-        payload: dict[str, Any] = {
-            "action": "next",
-            "messages": [message],
-            "model": model_def.slug,
-            "parent_message_id": parent_id or "client-created-root",
-            "conversation_mode": {"kind": "primary_assistant"},
-        }
-        if model_def.supports_thinking:
-            payload["thinking_effort"] = chosen_effort
-        if system_hints:
-            payload["system_hints"] = list(system_hints)
-        if conversation_id and parent_id and parent_id != "client-created-root":
-            payload["conversation_id"] = conversation_id
-        else:
-            payload["parent_message_id"] = "client-created-root"
-        return payload
+        return build_payload(prompt, conversation_id, parent_id, model_alias, effort, system_hints, selected_mcp_sources)
 
     def build_steer_payload(self, prompt: str, context: SteerContext) -> dict[str, Any]:
         """Build the observed native async-task steer request body."""
@@ -136,9 +110,7 @@ class WireTransport:
         model_def = ModelRegistry.resolve(model_alias)
         t0 = time.perf_counter()
 
-        chosen_effort = effort or model_def.default_effort
-        if chosen_effort not in ("extended", "standard"):
-            chosen_effort = "standard" if chosen_effort in ("low", "none", "off", "min", "medium") else "extended"
+        chosen_effort = normalize_effort(effort, model_def)
         thinking_effort = chosen_effort if model_def.supports_thinking else None
 
         # Step 1: Conduit Handshake
@@ -329,7 +301,7 @@ class WireTransport:
                     and dag_state.recipient in (None, "", "all", "final")
                     and dag_state.content_type == "text"
                     and dag_state.message_status in {"finished_successfully", "finished", "complete"}
-                    and bool(dag_state.finish_type)
+                    and (bool(dag_state.finish_type) or dag_state.message_status == "finished_successfully")
                     and bool(dag_state.node_id)
                 )
                 if recovered_completed_answer:
@@ -493,14 +465,30 @@ class WireTransport:
                 # user prompt would duplicate that work and corrupt turn order.
                 if tool_dispatched:
                     raise
+                if isinstance(e, asyncio.CancelledError) or type(e).__name__ == "SSEQueueOverflow" or "SSEQueueOverflow" in {c.__name__ for c in type(e).__mro__}:
+                    raise
                 err_msg = str(e)
                 if is_upstream_rejection(err_msg):
                     self.admission.record_rejection(err_msg)
                     raise
                 # Interruption 1: 401 Unauthorized / 403 Forbidden (Token expired / auth failure)
                 if any(x in err_msg for x in ("HTTP 401", "HTTP 403", "token_expired")):
-                    from ..core.token_cache import TokenCacheManager
-                    mgr = TokenCacheManager()
+                    mgr = self.cache_manager
+                    disk_bundle = mgr.load_disk_cache()
+                    if (
+                        disk_bundle
+                        and disk_bundle.access_token
+                        and disk_bundle.access_token != self.bundle.access_token
+                        and not mgr.is_token_expired(disk_bundle.access_token)
+                    ):
+                        self.bundle = disk_bundle
+                        try:
+                            await self.session.close()
+                        except Exception:
+                            pass
+                        self.session = AsyncSession(impersonate="chrome146")
+                        await asyncio.sleep(1)
+                        continue
                     # Only trigger browser lifebuoy if JWT is actually missing or expired (Rule 1)
                     if not self.bundle.access_token or mgr.is_token_expired(self.bundle.access_token):
                         try:

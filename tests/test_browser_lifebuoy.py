@@ -30,21 +30,22 @@ def test_lifebuoy_triggers_refresh(tmp_path: Path):
 
         with patch.dict("sys.modules", {"cloakbrowser": mock_cloak}):
             with patch.object(lifebuoy, "_extract_from_page", new_callable=AsyncMock) as mock_extract:
+                valid_token = _jwt_with_expiration(int(time.time()) + 3600)
                 mock_extract.return_value = {
-                    "accessToken": "new_refreshed_token_xyz",
+                    "accessToken": valid_token,
                     "cookies": {"cf_clearance": "new_clearance_123"},
                     "oaiDeviceId": "new_dev_uuid",
                     "accountId": "acc_001",
                 }
                 bundle = await lifebuoy.remint_credentials(headless=True)
-                assert bundle.access_token == "new_refreshed_token_xyz"
+                assert bundle.access_token == valid_token
                 assert bundle.cf_clearance == "new_clearance_123"
                 assert bundle.oai_device_id == "new_dev_uuid"
 
                 # Verify saved to disk
                 loaded = cache_mgr.load_disk_cache()
                 assert loaded is not None
-                assert loaded.access_token == "new_refreshed_token_xyz"
+                assert loaded.access_token == valid_token
                 assert loaded.cf_clearance == "new_clearance_123"
 
     asyncio.run(_run())
@@ -98,3 +99,40 @@ def test_lifebuoy_rejects_expired_token_without_overwriting_cache(tmp_path: Path
         assert cache_mgr.load_disk_cache().access_token == "old_cached_token"
 
     asyncio.run(_run())
+
+
+def test_interactive_login_updates_cache(tmp_path: Path):
+    async def _run():
+        cache_mgr = TokenCacheManager(tmp_path)
+        lifebuoy = BrowserLifebuoy(cache_mgr)
+
+        mock_context = AsyncMock()
+        mock_page = AsyncMock()
+        mock_page.is_closed = MagicMock(return_value=False)
+        mock_context.pages = [mock_page]
+
+
+        mock_cloak = MagicMock()
+        mock_cloak.launch_persistent_context_async = AsyncMock(return_value=mock_context)
+
+        valid_token = _jwt_with_expiration(int(time.time()) + 3600)
+        with patch.dict("sys.modules", {"cloakbrowser": mock_cloak}):
+            with patch.object(lifebuoy, "_extract_from_page", new_callable=AsyncMock) as extract:
+                extract.return_value = {
+                    "accessToken": valid_token,
+                    "cookies": {"cf_clearance": "cleared"},
+                    "oaiDeviceId": "dev_id",
+                    "accountId": "new_acc",
+                }
+                bundle = await lifebuoy.interactive_login(profile_dir=tmp_path, timeout=5)
+                assert bundle.access_token == valid_token
+                assert bundle.chatgpt_account_id == "new_acc"
+
+
+        loaded = cache_mgr.load_disk_cache()
+        assert loaded is not None
+        assert loaded.access_token == valid_token
+        assert loaded.chatgpt_account_id == "new_acc"
+
+    asyncio.run(_run())
+

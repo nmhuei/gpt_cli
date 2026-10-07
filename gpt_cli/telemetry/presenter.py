@@ -7,6 +7,7 @@ or arbitrarily large results into a terminal.
 
 from __future__ import annotations
 
+import json
 from typing import Any, TextIO
 
 from .formatter import extract_tool_command_summary
@@ -15,6 +16,17 @@ from .formatter import extract_tool_command_summary
 def _one_line(value: Any, *, limit: int = 140) -> str:
     text = str(value or "").replace("\n", " ").strip()
     return text if len(text) <= limit else f"{text[:limit - 1]}…"
+
+
+def format_tool_durations(data: dict[str, Any]) -> str:
+    parts = []
+    client = data.get("client_elapsed_ms")
+    server = data.get("server_duration_ms")
+    if isinstance(client, (int, float)) and not isinstance(client, bool) and client >= 0:
+        parts.append(f"client {client:g} ms")
+    if isinstance(server, (int, float)) and not isinstance(server, bool) and server >= 0:
+        parts.append(f"server {server:g} ms")
+    return " | ".join(parts)
 
 
 def summarize_tool_result(output: Any) -> str:
@@ -28,6 +40,7 @@ def summarize_tool_result(output: Any) -> str:
             return f"exit {output.get('exit_code')}"
         if "status" in output:
             return _one_line(output["status"])
+        return _one_line(json.dumps(output, ensure_ascii=False, default=str))
     text = _one_line(output)
     return text or "completed"
 
@@ -93,7 +106,9 @@ class TerminalTelemetryPresenter:
             self._write(f"🔧 {summary}{recovered}", cyan=True)
         elif event_type == "tool_call_finished":
             tool = str(data.get("tool") or "tool")
-            self._write(f"✓ {tool}: {summarize_tool_result(data.get('output'))}{recovered}", dim=True)
+            durations = format_tool_durations(data)
+            suffix = f" ({durations})" if durations else ""
+            self._write(f"✓ {tool}: {summarize_tool_result(data.get('output'))}{suffix}{recovered}", dim=True)
         elif event_type == "host_activity":
             action = _one_line(data.get("action") or "host operation")
             phase = _one_line(data.get("phase") or "progress")

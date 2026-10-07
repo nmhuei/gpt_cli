@@ -59,4 +59,67 @@ def _validate_gateway_messages(
             "Messages must contain role and content", anthropic=anthropic
         )
 
+    def _validate_content_blocks(value):
+        if not isinstance(value, (str, list)):
+            return False
+        if isinstance(value, list):
+            for block in value:
+                if not isinstance(block, dict):
+                    return False
+                if block.get("type") == "text" and not isinstance(block.get("text"), str):
+                    return False
+                if block.get("type") == "tool_result" and not _validate_content_blocks(block.get("content", "")):
+                    return False
+        return True
+
+    for message in messages:
+        content = message.get("content")
+        has_openai_tool_call = (
+            not anthropic
+            and message.get("role") == "assistant"
+            and (
+                bool(message.get("tool_calls"))
+                or bool(message.get("function_call"))
+            )
+        )
+        if content is None and has_openai_tool_call:
+            continue
+        if not _validate_content_blocks(content):
+            return None, _gateway_error(
+                "Text content must be a string", anthropic=anthropic
+            )
+
+    if "tools" in body:
+        tools = body.get("tools")
+        if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
+            return None, _gateway_error(
+                "Tools must be an array of objects", anthropic=anthropic
+            )
+        for tool in tools:
+            name = tool.get("name")
+            if isinstance(name, str) and name.strip():
+                continue
+            fn = tool.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn.get("name", "").strip():
+                continue
+            return None, _gateway_error(
+                "Each tool must have a non-empty string name", anthropic=anthropic
+            )
+
+    metadata = body.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return None, _gateway_error(
+            "Metadata must be an object", anthropic=anthropic
+        )
+
+    if "model" in body and not isinstance(body.get("model"), str):
+        return None, _gateway_error(
+            "Model must be a string", anthropic=anthropic
+        )
+
+    if "stream" in body and not isinstance(body.get("stream"), bool):
+        return None, _gateway_error(
+            "Stream must be a boolean", anthropic=anthropic
+        )
+
     return body, None

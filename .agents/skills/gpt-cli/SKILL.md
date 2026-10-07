@@ -34,7 +34,11 @@ gpt
 
 # 2. Gửi nhanh một prompt và stream kết quả ngay lập tức
 gpt "Xin chào, hãy giải thích ngắn gọn thuật toán RSA"
+
+# 3. Đăng nhập / đổi tài khoản qua CloakBrowser (tự động xóa profile cũ, mở profile mới)
+gpt login
 ```
+
 
 ### Gửi Prompt & Nối Tiếp Hội Thoại (DAG Continuity)
 
@@ -43,7 +47,7 @@ gpt "Xin chào, hãy giải thích ngắn gọn thuật toán RSA"
 gpt run -p "Phân tích đoạn mã sau: ..." --json
 
 # 2. Tạo một session mới hoàn toàn với tag đánh dấu
-gpt run -p "Nhiệm vụ mới" --new --tag "ctf-solver-1" --json
+gpt run -p "Nhiệm vụ mới" --tag "ctf-solver-1" --json
 
 # 3. Chạy prompt trên một session cụ thể đã có
 gpt run -p "Tiếp tục bài trước" -s "sess_e3affde1" --json
@@ -182,14 +186,19 @@ async def ask_gpt(prompt: str, session_tag: str = "worker"):
 # asyncio.run(ask_gpt("Xin chào!"))
 ```
 
-### Chạy Đa Luồng Song Song (Tối đa 5 Workers)
+### Chạy Song Song & Giới Hạn Concurrency
 
-Hệ thống đã kiểm chứng chịu tải **tối đa 5 workers đồng thời**:
+Có hai giới hạn độc lập cần phân biệt:
+
+- **Orchestration workflow:** có thể điều phối tối đa **8 independent `gpt` CLI agent invocations** đồng thời. Đây là giới hạn của workflow orchestration, không phải của product WorkerPool.
+- **Product WorkerPool:** mặc định **3 workers** (`DEFAULT_MAX_WORKERS`); có thể override bằng biến môi trường `WEBGPT_MAX_WORKERS`.
+
+Ví dụ dùng product pool:
 
 ```python
 from gpt_cli.pool.worker_pool import WorkerPool
 
-pool = WorkerPool(max_workers=5)
+pool = WorkerPool()  # default: 3, or WEBGPT_MAX_WORKERS override
 
 async def worker(prompt):
     async def task():
@@ -211,14 +220,14 @@ Khi gặp bug hoặc cần nâng cấp tính năng, đọc và sửa đúng file
 | [`gpt_cli/models/registry.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/models/registry.py) | Mapping alias model, đảm bảo lock `gpt-5-6-thinking` |
 | [`gpt_cli/transport/pow.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/pow.py) | Giải PoW SHA3-512 (18-element fingerprint) & Bootstrap `gAAAAAC...` |
 | [`gpt_cli/transport/conduit.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/conduit.py) | Handshake Sentinel prepare & Conduit prepare token |
-| [`gpt_cli/transport/wire.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/wire.py) | `curl_cffi` HTTP/2 POST stream, payload builder, auto-retry |
+| [`gpt_cli/transport/wire.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/wire.py) | `curl_cffi` HTTP/2 POST stream, turn transport; payload helpers in `transport/payloads.py` |
 | [`gpt_cli/telemetry/parser.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/telemetry/parser.py) | Bóc tách SSE stream (thoughts, commentary, tools, deltas, done) |
 | [`gpt_cli/transport/lifebuoy.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/transport/lifebuoy.py) | Chromium ngủ đông, chỉ mở 3s re-mint credentials khi 403 |
 | [`gpt_cli/session/registry.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/session/registry.py) | Quản lý `tool_sessions.json`, lưu cây DAG message |
 | [`gpt_cli/session/logger.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/session/logger.py) | Quản lý lưu log `history.jsonl` và `events.jsonl` theo session |
-| [`gpt_cli/pool/worker_pool.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/pool/worker_pool.py) | Giới hạn concurrency `asyncio.Semaphore(5)` |
+| [`gpt_cli/pool/worker_pool.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/pool/worker_pool.py) | Product WorkerPool giới hạn concurrency bằng semaphore (mặc định 3; override `WEBGPT_MAX_WORKERS`) |
 | [`gpt_cli/server/app.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/server/app.py) | Micro Gateway Starlette tương thích `/v1/chat/completions` & `/v1/messages` |
-| [`gpt_cli/cli/main.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/cli/main.py) | Entrypoint CLI `gpt`, `gpt run`, `gpt session`, `gpt start/stop` |
+| [`gpt_cli/cli/main.py`](file:///home/light/GitHub/gpt_cli/gpt_cli/cli/main.py) | Entrypoint CLI dispatch; run/session handlers in `cli/handlers.py` |
 
 ---
 

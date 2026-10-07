@@ -11,7 +11,8 @@ class TokenCacheManager:
     """Manages secure 0600 disk cache for OpenAI session tokens and cookies."""
     
     def __init__(self, cache_dir: Path | str | None = None):
-        self.cache_dir = Path(cache_dir or defaults.DEFAULT_CACHE_DIR).expanduser()
+        target = cache_dir or os.getenv("WEBGPT_CACHE_DIR") or defaults.DEFAULT_CACHE_DIR
+        self.cache_dir = Path(target).expanduser()
         self.cache_file = self.cache_dir / "webgpt-token-cache.json"
 
     def is_token_expired(self, token: str, skew_seconds: int = 60) -> bool:
@@ -21,15 +22,17 @@ class TokenCacheManager:
         try:
             parts = token.split(".")
             if len(parts) < 2:
-                return False
+                return True
             padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
             payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+            if not isinstance(payload, dict):
+                return True
             exp = payload.get("exp")
             if exp and isinstance(exp, (int, float)):
                 return time.time() >= (exp - skew_seconds)
+            return True
         except Exception:
-            pass
-        return False
+            return True
 
     def extract_account_id(self, token: str) -> str | None:
         """Extract chatgpt_account_id claim from JWT token payload."""
@@ -41,9 +44,13 @@ class TokenCacheManager:
                 padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
                 payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
                 auth_claim = payload.get("https://api.openai.com/auth")
+                acc = None
                 if isinstance(auth_claim, dict) and auth_claim.get("chatgpt_account_id"):
-                    return auth_claim["chatgpt_account_id"]
-                return payload.get("chatgpt_account_id")
+                    acc = auth_claim["chatgpt_account_id"]
+                if not acc:
+                    acc = payload.get("chatgpt_account_id")
+                if acc and isinstance(acc, str) and not acc.startswith("user-"):
+                    return acc
         except Exception:
             pass
         return None
@@ -54,17 +61,34 @@ class TokenCacheManager:
         try:
             data = json.loads(self.cache_file.read_text(encoding="utf-8"))
             token = data.get("access_token") or data.get("accessToken") or ""
-            cookies = data.get("cookies", {})
+            raw_cookies = data.get("cookies")
+            cookies: dict[str, str] = raw_cookies if isinstance(raw_cookies, dict) else {}
             if not token and not cookies:
                 return None
-            account_id = data.get("chatgpt_account_id") or data.get("account_id") or data.get("accountId")
+            raw_acc = data.get("chatgpt_account_id") or data.get("account_id") or data.get("accountId")
+            account_id = (
+                raw_acc
+                if isinstance(raw_acc, str) and not raw_acc.startswith("user-")
+                else None
+            )
             if not account_id and token:
                 account_id = self.extract_account_id(token)
+            oai_device_id = (
+                data.get("oai_device_id")
+                or data.get("oaiDeviceId")
+                or cookies.get("oai-device-id")
+                or cookies.get("oai-did")
+            )
+            cf_clearance = (
+                data.get("cf_clearance")
+                or data.get("cfClearance")
+                or cookies.get("cf_clearance")
+            )
             return TokenBundle(
                 access_token=token,
                 cookies=cookies,
-                oai_device_id=data.get("oai_device_id") or data.get("oaiDeviceId"),
-                cf_clearance=data.get("cf_clearance") or data.get("cfClearance"),
+                oai_device_id=oai_device_id,
+                cf_clearance=cf_clearance,
                 chatgpt_account_id=account_id,
             )
         except Exception:

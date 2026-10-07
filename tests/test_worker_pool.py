@@ -38,6 +38,19 @@ def test_worker_pool_execute():
     asyncio.run(_run())
 
 
+def test_worker_pool_none_uses_default():
+    pool = WorkerPool(max_workers=None)
+    assert pool.max_workers == 3
+
+
+def test_worker_pool_rejects_non_positive_limits():
+    with pytest.raises(ValueError, match="max_workers must be a positive integer"):
+        WorkerPool(max_workers=0)
+
+    with pytest.raises(ValueError, match="max_workers must be a positive integer"):
+        WorkerPool(max_workers=-1)
+
+
 def test_worker_finish_reason_reflects_lifecycle(monkeypatch, tmp_path, capsys):
     from gpt_cli.core.types import TokenBundle, TurnResult
     from gpt_cli.harness.worker import run_worker
