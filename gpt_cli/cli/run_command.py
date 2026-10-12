@@ -50,7 +50,7 @@ async def handle_run(args: argparse.Namespace, on_session_resolved=None, *, reso
                     curr_node = cdata.get("current_node") or "client-created-root"
                     title = cdata.get("title") or "Web Conversation"
                     sess = reg.create_session(tag=f"web:{title[:20]}")
-                    reg.checkpoint(sess.local_id, conversation_id=conv_id, message_id=curr_node, model=getattr(args, "model", "gpt-5-6-thinking"))
+                    reg.checkpoint(sess.local_id, conversation_id=conv_id, message_id=curr_node, model=getattr(args, "model", None) or Settings().default_model)
                     sess = reg.get_session(sess.local_id) or sess
                     if not getattr(args, "json", False) and not quiet:
                         print(f"Attached to ChatGPT Web thread: '{title}' ({conv_id})\n")
@@ -227,7 +227,7 @@ async def handle_run(args: argparse.Namespace, on_session_resolved=None, *, reso
             log_manager=log_mgr,
             token_bundle=bundle,
             session=sess,
-            model=getattr(args, "model", "gpt-5-6-thinking"),
+            model=getattr(args, "model", None) or Settings().default_model,
             effort=getattr(args, "effort", "extended"),
             emit_event=on_event_with_timer,
             capture_images=bool(getattr(args, "capture_images", False)),
@@ -253,7 +253,7 @@ async def handle_run(args: argparse.Namespace, on_session_resolved=None, *, reso
             turn_index=turn_number,
             prompt=raw_prompt,
             response="",
-            model=getattr(args, "model", "gpt-5-6-thinking"),
+            model=getattr(args, "model", None) or Settings().default_model,
             duration_ms=0,
             conversation_id=sess.conversation_id,
             message_id=sess.last_message_id,

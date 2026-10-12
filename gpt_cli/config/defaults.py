@@ -34,6 +34,7 @@ DEFAULT_CACHE_DIR = user_data_dir() / "profiles" / "personal"
 DEFAULT_SESSION_DIR = user_data_dir() / "sessions"
 DEFAULT_LOG_DIR = user_data_dir() / "logs"
 DEFAULT_PID_FILE = user_data_dir() / "gateway.pid"
+DEFAULT_MODELS_CACHE_FILE = user_data_dir() / "models_cache.json"
 
 # Network & Gateway
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
@@ -50,6 +51,7 @@ SENTINEL_CLASSIC_URL = "https://chatgpt.com/backend-api/sentinel/chat-requiremen
 FCONV_PREPARE_URL = "https://chatgpt.com/backend-api/f/conversation/prepare"
 FCONV_CONVERSATION_URL = "https://chatgpt.com/backend-api/f/conversation"
 FCONV_STEER_URL = "https://chatgpt.com/backend-api/f/steer_turn"
+MODELS_URL = "https://chatgpt.com/backend-api/models"
 
 DEFAULT_BUILD_HASH = "d92c92cf3397a05dfc98298acaae4f90b44e8386"
 
@@ -57,7 +59,7 @@ DEFAULT_BUILD_HASH = "d92c92cf3397a05dfc98298acaae4f90b44e8386"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
 # Models & Preferences
-DEFAULT_MODEL = "gpt-5-6-thinking"
+DEFAULT_MODEL = "gpt-6-thinking"
 DEFAULT_EFFORT = "extended"
 
 # Bridge & MCP Settings

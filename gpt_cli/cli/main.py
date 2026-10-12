@@ -63,7 +63,7 @@ async def handle_login(args, **kwargs):
 
 
 async def interactive_chat(
-    model: str = "gpt-5-6-thinking",
+    model: str = "gpt-6-thinking",
     session_id: str | None = None,
     resume: bool = False,
     bridge: str | None = None,
@@ -251,10 +251,38 @@ def handle_plugin(args: argparse.Namespace) -> None:
     return _handle_plugin(args, plugin_manager_cls=PluginManager)
 
 
+def handle_gateway(args: argparse.Namespace) -> None:
+    action = getattr(args, "gateway_action", None) or getattr(args, "command", "status")
+    if action == "start":
+        start_daemon(
+            host=getattr(args, "host", defaults.DEFAULT_GATEWAY_HOST),
+            port=getattr(args, "port", defaults.DEFAULT_GATEWAY_PORT),
+        )
+    elif action == "stop":
+        stop_daemon()
+    elif action == "restart":
+        stop_daemon()
+        start_daemon(
+            host=getattr(args, "host", defaults.DEFAULT_GATEWAY_HOST),
+            port=getattr(args, "port", defaults.DEFAULT_GATEWAY_PORT),
+        )
+    else:
+        st = status_daemon()
+        if getattr(args, "json", False):
+            print(json.dumps(st))
+        elif st["running"]:
+            print(f"Gateway is running (PID {st['pid']}).")
+        else:
+            print("Gateway is stopped.")
+
 
 def _main() -> None:
     # Reserve the removed command name so it is not treated as a free-form prompt.
-    known_commands = {"run", "agent", "research", "image", "chat", "steer", "session", "plugin", "start", "stop", "restart", "status", "login", "help", "-h", "--help"}
+    known_commands = {
+        "run", "agent", "research", "image", "chat", "steer", "session",
+        "plugin", "gateway", "start", "stop", "restart", "status", "login",
+        "help", "model", "models", "-h", "--help"
+    }
     if len(sys.argv) == 1:
         asyncio.run(interactive_chat())
         return
@@ -265,7 +293,7 @@ def _main() -> None:
         args = argparse.Namespace(
             command="run", prompt=prompt, pos_prompt=[], resume=False,
             resume_session=None, conversation=None, tag=None,
-            model="gpt-5-6-thinking", effort="extended", json=False,
+            model="gpt-6-thinking", effort="extended", json=False,
             bridge=None, no_bridge=False,
         )
         try:
@@ -302,23 +330,13 @@ def _main() -> None:
             handle_session(args)
         elif args.command == "plugin":
             handle_plugin(args)
-        elif args.command == "start":
-            start_daemon(host=args.host, port=args.port)
-        elif args.command == "stop":
-            stop_daemon()
-        elif args.command == "restart":
-            stop_daemon()
-            start_daemon(host=args.host, port=args.port)
-        elif args.command == "status":
-            st = status_daemon()
-            if args.json:
-                print(json.dumps(st))
-            elif st["running"]:
-                print(f"Gateway is running (PID {st['pid']}).")
-            else:
-                print("Gateway is stopped.")
+        elif args.command in ("gateway", "start", "stop", "restart", "status"):
+            handle_gateway(args)
         elif args.command == "login":
             asyncio.run(handle_login(args))
+        elif args.command in ("model", "models"):
+            from .model_command import run_model_command
+            sys.exit(asyncio.run(run_model_command(args)))
 
     except (SessionLookupError, SessionBusyError, SessionRegistryCorruptionError, LiveTurnRegistryCorruptionError, SessionDeleteError, SessionPartialDeleteError, ValueError) as exc:
         if getattr(args, "json", False):

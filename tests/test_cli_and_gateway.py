@@ -12,7 +12,7 @@ def test_gateway_health():
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "ok"
-    assert data["model"] == "gpt-5-6-thinking"
+    assert data["model"] == "gpt-6-thinking"
     assert data["transport"] == "wire_conduit"
 
 def test_gateway_models():
@@ -172,9 +172,64 @@ def test_session_new_json_emits_the_durable_local_id(monkeypatch, tmp_path, caps
 
 def test_cli_parser_gateway_command():
     parser = build_cli_parser()
-    args = parser.parse_args(["start", "--port", "18000"])
-    assert args.command == "start"
+    
+    # Unified gateway command
+    args_gw_start = parser.parse_args(["gateway", "start", "--port", "18000"])
+    assert args_gw_start.command == "gateway"
+    assert args_gw_start.gateway_action == "start"
+    assert args_gw_start.port == 18000
+
+    args_gw_stop = parser.parse_args(["gateway", "stop"])
+    assert args_gw_stop.command == "gateway"
+    assert args_gw_stop.gateway_action == "stop"
+
+    args_gw_restart = parser.parse_args(["gateway", "restart", "--port", "19000"])
+    assert args_gw_restart.command == "gateway"
+    assert args_gw_restart.gateway_action == "restart"
+    assert args_gw_restart.port == 19000
+
+    args_gw_status = parser.parse_args(["gateway", "status", "--json"])
+    assert args_gw_status.command == "gateway"
+    assert args_gw_status.gateway_action == "status"
+    assert args_gw_status.json is True
+
+    args_gw_bare = parser.parse_args(["gateway"])
+    assert args_gw_bare.command == "gateway"
+    assert args_gw_bare.gateway_action is None
+
+    # Legacy compatibility shortcuts via parse_cli_args
+    args = parse_cli_args(["start", "--port", "18000"])
+    assert args.command == "gateway"
+    assert args.gateway_action == "start"
     assert args.port == 18000
+
+    args_stop = parse_cli_args(["stop"])
+    assert args_stop.command == "gateway"
+    assert args_stop.gateway_action == "stop"
+
+    args_status = parse_cli_args(["status", "--json"])
+    assert args_status.command == "gateway"
+    assert args_status.gateway_action == "status"
+    assert args_status.json is True
+
+
+def test_handle_gateway_status_dispatch(capsys, monkeypatch):
+    import argparse
+    from gpt_cli.cli.main import handle_gateway
+
+    monkeypatch.setattr("gpt_cli.cli.main.status_daemon", lambda: {"running": False, "pid": None})
+    
+    # Test bare gateway command
+    args = argparse.Namespace(command="gateway", gateway_action=None, json=False)
+    handle_gateway(args)
+    captured = capsys.readouterr()
+    assert "Gateway is stopped." in captured.out
+
+    # Test gateway status --json
+    args_json = argparse.Namespace(command="gateway", gateway_action="status", json=True)
+    handle_gateway(args_json)
+    captured_json = capsys.readouterr()
+    assert '"running": false' in captured_json.out
 
 
 def test_cli_json_reports_model_terminal_without_claiming_success(monkeypatch, tmp_path, capsys):

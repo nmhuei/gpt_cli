@@ -134,22 +134,33 @@ def build_cli_parser() -> argparse.ArgumentParser:
     plugin_remove_p.add_argument("identifier", help="Plugin name, link ID, or connector ID")
     plugin_remove_p.add_argument("--json", action="store_true", help="Output JSON")
 
-    # 6. Gateway control
-    start_p = subparsers.add_parser("start", help="Start gateway daemon")
-    start_p.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
-    start_p.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
+    # 6. Gateway control (unified command with subcommands)
+    gateway_p = subparsers.add_parser("gateway", help="Manage background API gateway daemon (start, stop, restart, status)")
+    gateway_p.add_argument("--json", action="store_true", help="Output JSON")
+    gw_sub = gateway_p.add_subparsers(dest="gateway_action", required=False)
 
-    stop_p = subparsers.add_parser("stop", help="Stop gateway daemon")
-    restart_p = subparsers.add_parser("restart", help="Restart gateway daemon")
-    restart_p.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
-    restart_p.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
+    gw_start = gw_sub.add_parser("start", help="Start gateway daemon")
+    gw_start.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
+    gw_start.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
 
-    status_p = subparsers.add_parser("status", help="Check gateway daemon status")
-    status_p.add_argument("--json", action="store_true", help="Output JSON")
+    gw_stop = gw_sub.add_parser("stop", help="Stop gateway daemon")
+
+    gw_restart = gw_sub.add_parser("restart", help="Restart gateway daemon")
+    gw_restart.add_argument("--host", default=defaults.DEFAULT_GATEWAY_HOST)
+    gw_restart.add_argument("--port", type=int, default=defaults.DEFAULT_GATEWAY_PORT)
+
+    gw_status = gw_sub.add_parser("status", help="Check gateway daemon status")
+    gw_status.add_argument("--json", action="store_true", help="Output JSON")
 
     # 7. Browser login
     login_p = subparsers.add_parser("login", help="Open visible browser to log in to ChatGPT Web and refresh credentials")
     login_p.add_argument("--timeout", type=int, default=300, help="Maximum seconds to wait for login (default: 300)")
+
+    # 8. model (sync & list models)
+    model_p = subparsers.add_parser("model", aliases=["models"], help="Discover, sync, and list supported ChatGPT models")
+    model_p.add_argument("--sync", action="store_true", help="Force sync models from ChatGPT Web upstream")
+    model_p.add_argument("--offline", action="store_true", help="Only show locally cached models without network sync")
+    model_p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     return parser
 
 
@@ -167,10 +178,12 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
         normalized_argv = ["--help"]
     elif (
         len(normalized_argv) == 2
-        and normalized_argv[0] in {"plugin", "session"}
+        and normalized_argv[0] in {"plugin", "session", "gateway", "model", "models"}
         and normalized_argv[1] == "help"
     ):
         normalized_argv[1] = "--help"
+    elif normalized_argv and normalized_argv[0] in {"start", "stop", "restart", "status"}:
+        normalized_argv = ["gateway", *normalized_argv]
     if (
         normalized_argv
         and normalized_argv[0].startswith("-")

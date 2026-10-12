@@ -38,6 +38,9 @@ class Settings:
     cache_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_CACHE_DIR", str(defaults.user_data_dir() / "profiles" / "personal"))).expanduser())
     session_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_SESSION_DIR", str(defaults.user_data_dir() / "sessions"))).expanduser())
     log_dir: Path = field(default_factory=lambda: Path(os.getenv("WEBGPT_LOG_DIR", str(defaults.user_data_dir() / "logs"))).expanduser())
+    models_cache_file: Path = field(
+        default_factory=lambda: Path(os.getenv("WEBGPT_MODELS_CACHE_FILE", str(defaults.DEFAULT_MODELS_CACHE_FILE))).expanduser()
+    )
     gateway_host: str = field(default_factory=lambda: os.getenv("WEBGPT_GATEWAY_HOST", defaults.DEFAULT_GATEWAY_HOST))
     gateway_port: int = field(default_factory=lambda: int(os.getenv("WEBGPT_GATEWAY_PORT", str(defaults.DEFAULT_GATEWAY_PORT))))
     max_workers: int = field(default_factory=lambda: int(os.getenv("WEBGPT_MAX_WORKERS", str(defaults.DEFAULT_MAX_WORKERS))))
